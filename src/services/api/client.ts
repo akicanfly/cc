@@ -16,6 +16,10 @@ import {
   getAPIProvider,
   isFirstPartyAnthropicBaseUrl,
 } from 'src/utils/model/providers.js'
+import {
+  createOpenAICompatibleAnthropicClient,
+  isOpenAICompatibleEnabled,
+} from './openaiCompatible.js'
 import { getProxyFetchOptions } from 'src/utils/proxy.js'
 import {
   getIsNonInteractiveSession,
@@ -295,6 +299,12 @@ export async function getAnthropicClient({
     }
     // we have always been lying about the return type - this doesn't support batching or models
     return new AnthropicVertex(vertexArgs) as unknown as Anthropic
+  }
+
+  if (isOpenAICompatibleEnabled()) {
+    return createOpenAICompatibleAnthropicClient({
+      fetchOverride: resolvedFetch,
+    }) as Anthropic
   }
 
   // Determine authentication method based on available tokens
