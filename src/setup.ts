@@ -10,6 +10,7 @@ import { getCwd } from 'src/utils/cwd.js'
 import { checkForReleaseNotes } from 'src/utils/releaseNotes.js'
 import { setCwd } from 'src/utils/Shell.js'
 import { initSinks } from 'src/utils/sinks.js'
+import { seedGrowthBookCacheIfMissing } from 'src/utils/seedGrowthBookCache.js'
 import {
   getIsNonInteractiveSession,
   getProjectRoot,
@@ -368,6 +369,7 @@ export async function setup(
       ) // Start team memory sync watcher
     }
   }
+  seedGrowthBookCacheIfMissing() // Seed disk cache so yolo/auto-mode works with zero network
   initSinks() // Attach error log + analytics sinks and drain queued events
 
   // Session-success-rate denominator. Emit immediately after the analytics

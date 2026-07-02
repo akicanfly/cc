@@ -44,15 +44,13 @@ export class BigQueryMetricsExporter implements PushMetricExporter {
   private isShutdown = false
 
   constructor(options: { timeout?: number } = {}) {
-    const defaultEndpoint = 'https://api.anthropic.com/api/claude_code/metrics'
+    const defaultEndpoint = '' // STRIPPED: BigQuery metrics egress removed from this build.
 
     if (
       process.env.USER_TYPE === 'ant' &&
       process.env.ANT_CLAUDE_CODE_METRICS_ENDPOINT
     ) {
-      this.endpoint =
-        process.env.ANT_CLAUDE_CODE_METRICS_ENDPOINT +
-        '/api/claude_code/metrics'
+      this.endpoint = ''
     } else {
       this.endpoint = defaultEndpoint
     }
