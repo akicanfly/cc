@@ -1,6 +1,6 @@
 import { c as _c } from "react/compiler-runtime";
 import * as React from 'react';
-import { type ReactNode, useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Box, Text } from '../ink.js';
 import type { SandboxViolationEvent } from '../utils/sandbox/sandbox-adapter.js';
 import { SandboxManager } from '../utils/sandbox/sandbox-adapter.js';
@@ -32,12 +32,15 @@ export function SandboxViolationExpandedView() {
   let t2;
   if ($[1] === Symbol.for("react.memo_cache_sentinel")) {
     t1 = () => {
-      const store = SandboxManager.getSandboxViolationStore();
-      const unsubscribe = store.subscribe(allViolations => {
+      const updateViolations = () => {
+        const store = SandboxManager.getSandboxViolationStore();
+        const allViolations = store.getAll();
         setViolations(allViolations.slice(-10));
-        setTotalCount(store.getTotalCount());
-      });
-      return unsubscribe;
+        setTotalCount(allViolations.length);
+      };
+      updateViolations();
+      const interval = setInterval(updateViolations, 1000);
+      return () => clearInterval(interval);
     };
     t2 = [];
     $[1] = t1;
@@ -93,6 +96,9 @@ export function SandboxViolationExpandedView() {
   }
   return t8;
 }
-function _temp(v, i) {
-  return <Box key={`${v.timestamp.getTime()}-${i}`} paddingLeft={2}><Text dimColor={true}>{formatTime(v.timestamp)}{v.command ? ` ${v.command}:` : ""} {v.line}</Text></Box>;
+function _temp(v: SandboxViolationEvent, i: number) {
+  const timestamp = v.timestamp instanceof Date ? v.timestamp : new Date();
+  const command = typeof v.command === 'string' ? v.command : '';
+  const line = typeof v.line === 'string' ? v.line : String(v.line ?? '');
+  return <Box key={`${timestamp.getTime()}-${i}`} paddingLeft={2}><Text dimColor={true}>{formatTime(timestamp)}{command ? ` ${command}:` : ""} {line}</Text></Box>;
 }

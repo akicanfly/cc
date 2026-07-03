@@ -49,6 +49,7 @@ import {
   maybeResizeAndDownsampleImageBuffer,
 } from '../../utils/imageResizer.js'
 import { lazySchema } from '../../utils/lazySchema.js'
+import { logForDebugging } from '../../utils/debug.js'
 import { logError } from '../../utils/log.js'
 import { isAutoMemFile } from '../../utils/memoryFileDetection.js'
 import { createUserMessage } from '../../utils/messages.js'
@@ -71,6 +72,7 @@ import {
 import type { PermissionDecision } from '../../utils/permissions/PermissionResult.js'
 import { matchWildcardPattern } from '../../utils/permissions/shellRuleMatching.js'
 import { readFileInRange } from '../../utils/readFileInRange.js'
+import { withTimeout } from '../../utils/sleep.js'
 import { semanticNumber } from '../../utils/semanticNumber.js'
 import { jsonStringify } from '../../utils/slowOperations.js'
 import { BASH_TOOL_NAME } from '../BashTool/toolName.js'
@@ -129,6 +131,7 @@ function isBlockedDevicePath(filePath: string): boolean {
 
 // Narrow no-break space (U+202F) used by some macOS versions in screenshot filenames
 const THIN_SPACE = String.fromCharCode(8239)
+const READ_SKILL_DISCOVERY_TIMEOUT_MS = 500
 
 /**
  * Resolves macOS screenshot paths that may have different space characters.
@@ -572,26 +575,39 @@ export const FileReadTool = buildTool({
       }
     }
 
-    // Discover skills from this file's path (fire-and-forget, non-blocking)
-    // Skip in simple mode - no skills available
+    // Discover skills from this file's path. This is best-effort and must not
+    // block the actual file read; filesystem/gitignore checks can hang in odd
+    // repos or mounts, which otherwise leaves the UI idle on a Read tool call.
     const cwd = getCwd()
     if (!isEnvTruthy(process.env.CLAUDE_CODE_SIMPLE)) {
-      const newSkillDirs = await discoverSkillDirsForPaths([fullFilePath], cwd)
-      if (newSkillDirs.length > 0) {
-        // Store discovered dirs for attachment display
-        for (const dir of newSkillDirs) {
-          context.dynamicSkillDirTriggers?.add(dir)
+      try {
+        logForDebugging(`[Read] discovering skills for ${fullFilePath}`)
+        const newSkillDirs = await withTimeout(
+          discoverSkillDirsForPaths([fullFilePath], cwd),
+          READ_SKILL_DISCOVERY_TIMEOUT_MS,
+          `[Read] skill discovery timed out for ${fullFilePath}`,
+        )
+        if (newSkillDirs.length > 0) {
+          // Store discovered dirs for attachment display
+          for (const dir of newSkillDirs) {
+            context.dynamicSkillDirTriggers?.add(dir)
+          }
+          // Don't await - let skill loading happen in the background
+          addSkillDirectories(newSkillDirs).catch(error => {
+            logForDebugging(`[Read] dynamic skill loading failed: ${error}`)
+          })
         }
-        // Don't await - let skill loading happen in the background
-        addSkillDirectories(newSkillDirs).catch(() => {})
-      }
 
-      // Activate conditional skills whose path patterns match this file
-      activateConditionalSkillsForPaths([fullFilePath], cwd)
+        // Activate conditional skills whose path patterns match this file
+        activateConditionalSkillsForPaths([fullFilePath], cwd)
+      } catch (error) {
+        logForDebugging(String(error))
+      }
     }
 
     try {
-      return await callInner(
+      logForDebugging(`[Read] reading ${fullFilePath}`)
+      const result = await callInner(
         file_path,
         fullFilePath,
         fullFilePath,
@@ -605,7 +621,10 @@ export const FileReadTool = buildTool({
         context,
         parentMessage?.message.id,
       )
+      logForDebugging(`[Read] completed ${fullFilePath}`)
+      return result
     } catch (error) {
+      logForDebugging(`[Read] failed ${fullFilePath}: ${error}`)
       // Handle file-not-found: suggest similar files
       const code = getErrnoCode(error)
       if (code === 'ENOENT') {

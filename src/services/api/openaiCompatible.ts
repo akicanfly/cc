@@ -28,6 +28,19 @@ type OpenAIChunk = {
   }
 }
 
+type OpenAIMessage =
+  | { role: 'system' | 'user'; content: string }
+  | {
+      role: 'assistant'
+      content: string | null
+      tool_calls?: Array<{
+        id: string
+        type: 'function'
+        function: { name: string; arguments: string }
+      }>
+    }
+  | { role: 'tool'; tool_call_id: string; content: string }
+
 export function isOpenAICompatibleEnabled(): boolean {
   return !!getOpenAICompatibleConfig()
 }
@@ -74,7 +87,7 @@ async function createOpenAICompatibleMessage(
         'Content-Type': 'application/json',
         ...config.headers,
       },
-      body: JSON.stringify({ ...toOpenAIRequest(params), stream: false }),
+      body: JSON.stringify(toOpenAIRequest(params, false)),
     },
   )
 
@@ -97,16 +110,26 @@ async function createOpenAICompatibleMessage(
   }
   const message = parsed.choices?.[0]?.message
   const content: Array<Record<string, unknown>> = []
-  if (message?.content) {
-    content.push({ type: 'text', text: message.content })
-  }
-  for (const toolCall of message?.tool_calls ?? []) {
+  const textualToolCall = parseTextualToolCall(message?.content)
+  if (textualToolCall && !message?.tool_calls?.length) {
     content.push({
       type: 'tool_use',
-      id: toolCall.id ?? `toolu_${randomUUID()}`,
-      name: toolCall.function?.name ?? 'tool',
-      input: parseToolInput(toolCall.function?.arguments),
+      id: `toolu_${randomUUID()}`,
+      name: textualToolCall.name,
+      input: textualToolCall.input,
     })
+  } else {
+    if (message?.content) {
+      content.push({ type: 'text', text: message.content })
+    }
+    for (const toolCall of message?.tool_calls ?? []) {
+      content.push({
+        type: 'tool_use',
+        id: toolCall.id ?? `toolu_${randomUUID()}`,
+        name: toolCall.function?.name ?? 'tool',
+        input: parseToolInput(toolCall.function?.arguments),
+      })
+    }
   }
 
   return {
@@ -115,7 +138,9 @@ async function createOpenAICompatibleMessage(
     role: 'assistant',
     model: params.model,
     content,
-    stop_reason: mapStopReason(parsed.choices?.[0]?.finish_reason ?? 'stop'),
+    stop_reason: textualToolCall && !message?.tool_calls?.length
+      ? 'tool_use'
+      : mapStopReason(parsed.choices?.[0]?.finish_reason ?? 'stop'),
     stop_sequence: null,
     usage: {
       input_tokens: parsed.usage?.prompt_tokens ?? 0,
@@ -191,17 +216,14 @@ function parseHeaders(raw: string | undefined): Record<string, string> {
   return {}
 }
 
-function toOpenAIRequest(params: BetaMessageStreamParams): Record<string, unknown> {
+function toOpenAIRequest(params: BetaMessageStreamParams, stream: boolean = true): Record<string, unknown> {
   return {
     model: params.model,
-    stream: true,
-    stream_options: { include_usage: true },
+    stream,
+    ...(stream ? { stream_options: { include_usage: true } } : {}),
     messages: [
       ...systemMessages(params.system),
-      ...params.messages.map(message => ({
-        role: message.role,
-        content: contentToText(message.content),
-      })),
+      ...params.messages.flatMap(message => toOpenAIMessages(message)),
     ],
     ...(params.max_tokens ? { max_tokens: params.max_tokens } : {}),
     ...(params.temperature !== undefined ? { temperature: params.temperature } : {}),
@@ -227,23 +249,63 @@ function toOpenAIRequest(params: BetaMessageStreamParams): Record<string, unknow
   }
 }
 
-function systemMessages(system: BetaMessageStreamParams['system']): Array<{ role: 'system'; content: string }> {
+function systemMessages(system: BetaMessageStreamParams['system']): OpenAIMessage[] {
   if (!system) return []
   if (typeof system === 'string') return [{ role: 'system', content: system }]
   return [{ role: 'system', content: system.map(block => ('text' in block ? block.text : '')).join('\n') }]
 }
 
-function contentToText(content: BetaMessageStreamParams['messages'][number]['content']): string {
-  if (typeof content === 'string') return content
-  return content
-    .map(block => {
-      if (block.type === 'text') return block.text
-      if (block.type === 'tool_result') return typeof block.content === 'string' ? block.content : JSON.stringify(block.content ?? '')
-      if (block.type === 'tool_use') return `Tool call ${block.name}: ${JSON.stringify(block.input)}`
-      return ''
-    })
-    .filter(Boolean)
+function toOpenAIMessages(
+  message: BetaMessageStreamParams['messages'][number],
+): OpenAIMessage[] {
+  if (typeof message.content === 'string') {
+    return [{ role: message.role, content: message.content }]
+  }
+
+  if (message.role === 'assistant') {
+    const text = message.content
+      .filter(block => block.type === 'text')
+      .map(block => block.text)
+      .join('\n')
+    const toolCalls = message.content
+      .filter(block => block.type === 'tool_use')
+      .map(block => ({
+        id: block.id,
+        type: 'function' as const,
+        function: {
+          name: block.name,
+          arguments: JSON.stringify(block.input ?? {}),
+        },
+      }))
+    return [
+      {
+        role: 'assistant',
+        content: text || null,
+        ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+      },
+    ]
+  }
+
+  const messages: OpenAIMessage[] = []
+  const text = message.content
+    .filter(block => block.type === 'text')
+    .map(block => block.text)
     .join('\n')
+  if (text) messages.push({ role: 'user', content: text })
+
+  for (const block of message.content) {
+    if (block.type !== 'tool_result') continue
+    messages.push({
+      role: 'tool',
+      tool_call_id: block.tool_use_id,
+      content:
+        typeof block.content === 'string'
+          ? block.content
+          : JSON.stringify(block.content ?? ''),
+    })
+  }
+
+  return messages.length ? messages : [{ role: 'user', content: '' }]
 }
 
 function fromOpenAIStream(
@@ -268,6 +330,7 @@ function fromOpenAIStream(
     }
 
     let textStarted = false
+    let textualToolCandidate = ''
     const toolIndexes = new Map<number, number>()
     let nextBlockIndex = 0
     let stopReason: string | null = null
@@ -286,19 +349,29 @@ function fromOpenAIStream(
 
       const content = choice?.delta?.content
       if (content) {
-        if (!textStarted) {
-          textStarted = true
-          yield { type: 'content_block_start', index: nextBlockIndex, content_block: { type: 'text', text: '' } }
+        const candidate = textualToolCandidate + content
+        if (!textStarted && toolIndexes.size === 0 && isPotentialTextualToolCall(candidate)) {
+          textualToolCandidate = candidate
+        } else {
+          if (!textStarted) {
+            textStarted = true
+            yield { type: 'content_block_start', index: nextBlockIndex, content_block: { type: 'text', text: '' } }
+            nextBlockIndex += 1
+          }
+          if (textualToolCandidate) {
+            yield { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: textualToolCandidate } }
+            textualToolCandidate = ''
+          }
+          yield { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: content } }
         }
-        yield { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: content } }
       }
 
       for (const toolCall of choice?.delta?.tool_calls ?? []) {
         const toolCallIndex = toolCall.index ?? 0
         let blockIndex = toolIndexes.get(toolCallIndex)
         if (blockIndex === undefined) {
-          blockIndex = textStarted ? ++nextBlockIndex : nextBlockIndex
-          nextBlockIndex = blockIndex
+          blockIndex = nextBlockIndex
+          nextBlockIndex += 1
           toolIndexes.set(toolCallIndex, blockIndex)
           yield {
             type: 'content_block_start',
@@ -318,6 +391,35 @@ function fromOpenAIStream(
       }
     }
 
+    const textualToolCall = toolIndexes.size === 0 ? parseTextualToolCall(textualToolCandidate) : null
+    if (textualToolCall) {
+      yield {
+        type: 'content_block_start',
+        index: 0,
+        content_block: {
+          type: 'tool_use',
+          id: `toolu_${randomUUID()}`,
+          name: textualToolCall.name,
+          input: {},
+        },
+      }
+      yield {
+        type: 'content_block_delta',
+        index: 0,
+        delta: {
+          type: 'input_json_delta',
+          partial_json: JSON.stringify(textualToolCall.input),
+        },
+      }
+      yield { type: 'content_block_stop', index: 0 }
+      stopReason = 'tool_use'
+    } else if (textualToolCandidate) {
+      if (!textStarted) {
+        textStarted = true
+        yield { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }
+      }
+      yield { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: textualToolCandidate } }
+    }
     if (textStarted) yield { type: 'content_block_stop', index: 0 }
     for (const blockIndex of toolIndexes.values()) yield { type: 'content_block_stop', index: blockIndex }
     yield {
@@ -371,5 +473,26 @@ function parseToolInput(input: string | undefined): unknown {
     return JSON.parse(input) as unknown
   } catch {
     return {}
+  }
+}
+
+function isPotentialTextualToolCall(text: string): boolean {
+  const trimmed = text.trimStart()
+  return 'Tool call'.startsWith(trimmed) || trimmed.startsWith('Tool call')
+}
+
+function parseTextualToolCall(
+  text: string | null | undefined,
+): { name: string; input: unknown } | null {
+  if (!text) return null
+  const trimmed = text.trim()
+  const match = trimmed.match(/^Tool call\s+([A-Za-z0-9_-]+):\s*([\s\S]+)$/)
+  if (!match) return null
+  const rawInput = match[2]?.trim()
+  if (!rawInput) return null
+  try {
+    return { name: match[1]!, input: JSON.parse(rawInput) as unknown }
+  } catch {
+    return null
   }
 }

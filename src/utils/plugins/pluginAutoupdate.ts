@@ -1,9 +1,12 @@
 /**
- * Background plugin autoupdate functionality
+ * Plugin autoupdate functionality.
  *
- * At startup, this module:
- * 1. First updates marketplaces that have autoUpdate enabled
- * 2. Then checks all installed plugins from those marketplaces and updates them
+ * NOTE: In this build, the background startup trigger
+ * (autoUpdateMarketplacesAndPluginsInBackground) is STUBBED — it does
+ * nothing. The module still exports the supporting helpers (e.g.
+ * updatePluginsForMarketplaces, onPluginsAutoUpdated, getAutoUpdatedPluginNames)
+ * used by the manual `/plugin marketplace update` path in
+ * ManageMarketplaces.tsx.
  *
  * Updates are non-inplace (disk-only), requiring a restart to take effect.
  * Official Anthropic marketplaces have autoUpdate enabled by default,
@@ -11,10 +14,8 @@
  */
 
 import { updatePluginOp } from '../../services/plugins/pluginOperations.js'
-import { shouldSkipPluginAutoupdate } from '../config.js'
 import { logForDebugging } from '../debug.js'
 import { errorMessage } from '../errors.js'
-import { logError } from '../log.js'
 import {
   getPendingUpdatesDetails,
   hasPendingUpdates,
@@ -24,7 +25,6 @@ import {
 import {
   getDeclaredMarketplaces,
   loadKnownMarketplacesConfig,
-  refreshMarketplace,
 } from './marketplaceManager.js'
 import { parsePluginIdentifier } from './pluginIdentifier.js'
 import { isMarketplaceAutoUpdate, type PluginScope } from './schemas.js'
@@ -210,75 +210,11 @@ async function updatePlugins(
 }
 
 /**
- * Auto-update marketplaces and plugins in the background.
- *
- * This function:
- * 1. Checks which marketplaces have autoUpdate enabled
- * 2. Refreshes only those marketplaces (git pull/re-download)
- * 3. Updates installed plugins from those marketplaces
- * 4. If any plugins were updated, notifies via the registered callback
- *
- * Official Anthropic marketplaces have autoUpdate enabled by default,
- * but users can disable it per-marketplace in the UI.
- *
- * This function runs silently without blocking user interaction.
- * Called from main.tsx during startup as a background job.
+ * STUBBED in this build: background plugin/marketplace auto-update disabled.
+ * Never refreshes marketplaces, never updates installed plugins on startup.
+ * Returns immediately. Manual `/plugin marketplace update` still works
+ * (see ManageMarketplaces.tsx) and other exports in this module remain intact.
  */
 export function autoUpdateMarketplacesAndPluginsInBackground(): void {
-  void (async () => {
-    if (shouldSkipPluginAutoupdate()) {
-      logForDebugging('Plugin autoupdate: skipped (auto-updater disabled)')
-      return
-    }
-
-    try {
-      // Get marketplaces with autoUpdate enabled
-      const autoUpdateEnabledMarketplaces =
-        await getAutoUpdateEnabledMarketplaces()
-
-      if (autoUpdateEnabledMarketplaces.size === 0) {
-        return
-      }
-
-      // Refresh only marketplaces with autoUpdate enabled
-      const refreshResults = await Promise.allSettled(
-        Array.from(autoUpdateEnabledMarketplaces).map(async name => {
-          try {
-            await refreshMarketplace(name, undefined, {
-              disableCredentialHelper: true,
-            })
-          } catch (error) {
-            logForDebugging(
-              `Plugin autoupdate: failed to refresh marketplace ${name}: ${errorMessage(error)}`,
-              { level: 'warn' },
-            )
-          }
-        }),
-      )
-
-      // Log any refresh failures
-      const failures = refreshResults.filter(r => r.status === 'rejected')
-      if (failures.length > 0) {
-        logForDebugging(
-          `Plugin autoupdate: ${failures.length} marketplace refresh(es) failed`,
-          { level: 'warn' },
-        )
-      }
-
-      logForDebugging('Plugin autoupdate: checking installed plugins')
-      const updatedPlugins = await updatePlugins(autoUpdateEnabledMarketplaces)
-
-      if (updatedPlugins.length > 0) {
-        if (pluginUpdateCallback) {
-          // Callback is already registered, invoke it immediately
-          pluginUpdateCallback(updatedPlugins)
-        } else {
-          // Callback not yet registered (REPL not mounted), store for later delivery
-          pendingNotification = updatedPlugins
-        }
-      }
-    } catch (error) {
-      logError(error)
-    }
-  })()
+  return
 }

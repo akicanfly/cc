@@ -32,6 +32,8 @@ import { formatError } from '../../utils/toolErrors.js'
 import { isMcpTool } from '../mcp/utils.js'
 import type { McpServerType, MessageUpdateLazy } from './toolExecution.js'
 
+const BYPASS_PRE_TOOL_HOOK_TIMEOUT_MS = 5_000
+
 export type PostToolUseHooksResult<Output> =
   | MessageUpdateLazy<AttachmentMessage | ProgressMessage<HookProgress>>
   | { updatedMCPToolOutput: Output }
@@ -463,14 +465,25 @@ export async function* runPreToolUseHooks(
   try {
     const appState = toolUseContext.getAppState()
 
+    const permissionMode = appState.toolPermissionContext.mode
+    const timeoutMs =
+      permissionMode === 'bypassPermissions'
+        ? BYPASS_PRE_TOOL_HOOK_TIMEOUT_MS
+        : undefined
+
+    logForDebugging(
+      `Running PreToolUse hooks for ${tool.name} (mode=${permissionMode}, timeout=${timeoutMs ?? 'default'}ms)`,
+      { level: 'verbose' },
+    )
+
     for await (const result of executePreToolHooks(
       tool.name,
       toolUseID,
       processedInput,
       toolUseContext,
-      appState.toolPermissionContext.mode,
+      permissionMode,
       toolUseContext.abortController.signal,
-      undefined, // timeoutMs - use default
+      timeoutMs,
       toolUseContext.requestPrompt,
       tool.getToolUseSummary?.(processedInput),
     )) {
