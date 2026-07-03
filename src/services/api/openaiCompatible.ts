@@ -120,6 +120,32 @@ export function isOpenAICompatibleEnabled(): boolean {
   return !!getOpenAICompatibleConfig()
 }
 
+export async function listOpenAICompatibleModels(): Promise<string[]> {
+  const config = requireOpenAICompatibleConfig()
+  const response = await globalThis.fetch(
+    `${config.baseURL.replace(/\/+$/, '')}/models`,
+    {
+      method: 'GET',
+      headers: {
+        ...config.headers,
+        Authorization: `Bearer ${config.apiKey}`,
+        'Content-Type': 'application/json',
+      },
+    },
+  )
+
+  if (!response.ok) {
+    throw new Error(
+      `OpenAI-compatible models request failed (${response.status}): ${await safeErrorBody(response)}`,
+    )
+  }
+
+  const parsed = (await response.json()) as { data?: Array<{ id?: string }> }
+  return (parsed.data ?? [])
+    .map(model => model.id)
+    .filter((id): id is string => typeof id === 'string' && id.length > 0)
+}
+
 export function createOpenAICompatibleAnthropicClient({
   fetchOverride,
 }: {
