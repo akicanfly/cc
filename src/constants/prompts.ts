@@ -97,7 +97,7 @@ const skillSearchFeatureCheck = feature('EXPERIMENTAL_SKILL_SEARCH')
   : null
 /* eslint-enable @typescript-eslint/no-require-imports */
 import type { OutputStyleConfig } from './outputStyles.js'
-import { CYBER_RISK_INSTRUCTION } from './cyberRiskInstruction.js'
+// import { CYBER_RISK_INSTRUCTION } from './cyberRiskInstruction.js'
 
 export const CLAUDE_CODE_DOCS_MAP_URL =
   'https://code.claude.com/docs/en/claude_code_docs_map.md'
@@ -172,16 +172,33 @@ export function prependBullets(items: Array<string | string[]>): string[] {
   )
 }
 
+
+
+// function getSimpleIntroSection(
+  // outputStyleConfig: OutputStyleConfig | null,
+// ): string {
+  // // eslint-disable-next-line custom-rules/prompt-spacing
+  // return `
+// You are an interactive agent that helps users ${outputStyleConfig !== null ? 'according to your "Output Style" below, which describes how you should respond to user queries.' : 'with software engineering tasks.'} Use the instructions below and the tools available to you to assist the user.
+
+// ${CYBER_RISK_INSTRUCTION}
+// IMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.`
+// }
+
+
+
+
 function getSimpleIntroSection(
   outputStyleConfig: OutputStyleConfig | null,
 ): string {
   // eslint-disable-next-line custom-rules/prompt-spacing
   return `
-You are an interactive agent that helps users ${outputStyleConfig !== null ? 'according to your "Output Style" below, which describes how you should respond to user queries.' : 'with software engineering tasks.'} Use the instructions below and the tools available to you to assist the user.
-
-${CYBER_RISK_INSTRUCTION}
-IMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident that the URLs are for helping the user with programming. You may use URLs provided by the user in their messages or local files.`
+You are an interactive agent that helps users ${outputStyleConfig !== null ? 'according to your "Output Style" below, which describes how you should respond to user queries.' : 'with software engineering tasks.'} Use the instructions below and the tools available to you to assist the user.`
 }
+
+
+
+
 
 function getSimpleSystemSection(): string {
   const items = [
@@ -469,9 +486,7 @@ export async function getSystemPrompt(
   ) {
     logForDebugging(`[SystemPrompt] path=simple-proactive`)
     return [
-      `\nYou are an autonomous agent. Use the available tools to do useful work.
-
-${CYBER_RISK_INSTRUCTION}`,
+      `\nYou are an autonomous agent. Use the available tools to do useful work.`,
       getSystemRemindersSection(),
       await loadMemoryPrompt(),
       envInfo,
@@ -617,25 +632,25 @@ export async function computeEnvInfo(
   // DCE: `process.env.USER_TYPE === 'ant'` is build-time --define. It MUST be
   // inlined at each callsite (not hoisted to a const) so the bundler can
   // constant-fold it to `false` in external builds and eliminate the branch.
-  let modelDescription = ''
-  if (process.env.USER_TYPE === 'ant' && isUndercover()) {
-    // suppress
-  } else {
-    const marketingName = getMarketingNameForModel(modelId)
-    modelDescription = marketingName
-      ? `You are powered by the model named ${marketingName}. The exact model ID is ${modelId}.`
-      : `You are powered by the model ${modelId}.`
-  }
+  // let modelDescription = ''
+  // if (process.env.USER_TYPE === 'ant' && isUndercover()) {
+  //   // suppress
+  // } else {
+  //   const marketingName = getMarketingNameForModel(modelId)
+  //   modelDescription = marketingName
+  //     ? `You are powered by the model named ${marketingName}. The exact model ID is ${modelId}.`
+  //     : `You are powered by the model ${modelId}.`
+  // }
 
   const additionalDirsInfo =
     additionalWorkingDirectories && additionalWorkingDirectories.length > 0
       ? `Additional working directories: ${additionalWorkingDirectories.join(', ')}\n`
       : ''
 
-  const cutoff = getKnowledgeCutoff(modelId)
-  const knowledgeCutoffMessage = cutoff
-    ? `\n\nAssistant knowledge cutoff is ${cutoff}.`
-    : ''
+  // const cutoff = getKnowledgeCutoff(modelId)
+  // const knowledgeCutoffMessage = cutoff
+  //   ? `\n\nAssistant knowledge cutoff is ${cutoff}.`
+  //   : ''
 
   return `Here is useful information about the environment you are running in:
 <env>
@@ -644,8 +659,7 @@ Is directory a git repo: ${isGit ? 'Yes' : 'No'}
 ${additionalDirsInfo}Platform: ${env.platform}
 ${getShellInfoLine()}
 OS Version: ${unameSR}
-</env>
-${modelDescription}${knowledgeCutoffMessage}`
+</env>`
 }
 
 export async function computeSimpleEnvInfo(
@@ -656,20 +670,20 @@ export async function computeSimpleEnvInfo(
 
   // Undercover: strip all model name/ID references. See computeEnvInfo.
   // DCE: inline the USER_TYPE check at each site — do NOT hoist to a const.
-  let modelDescription: string | null = null
-  if (process.env.USER_TYPE === 'ant' && isUndercover()) {
-    // suppress
-  } else {
-    const marketingName = getMarketingNameForModel(modelId)
-    modelDescription = marketingName
-      ? `You are powered by the model named ${marketingName}. The exact model ID is ${modelId}.`
-      : `You are powered by the model ${modelId}.`
-  }
+  // let modelDescription: string | null = null
+  // if (process.env.USER_TYPE === 'ant' && isUndercover()) {
+  //   // suppress
+  // } else {
+  //   const marketingName = getMarketingNameForModel(modelId)
+  //   modelDescription = marketingName
+  //     ? `You are powered by the model named ${marketingName}. The exact model ID is ${modelId}.`
+  //     : `You are powered by the model ${modelId}.`
+  // }
 
-  const cutoff = getKnowledgeCutoff(modelId)
-  const knowledgeCutoffMessage = cutoff
-    ? `Assistant knowledge cutoff is ${cutoff}.`
-    : null
+  // const cutoff = getKnowledgeCutoff(modelId)
+  // const knowledgeCutoffMessage = cutoff
+  //   ? `Assistant knowledge cutoff is ${cutoff}.`
+  //   : null
 
   const cwd = getCwd()
   const isWorktree = getCurrentWorktreeSession() !== null
@@ -689,17 +703,17 @@ export async function computeSimpleEnvInfo(
     `Platform: ${env.platform}`,
     getShellInfoLine(),
     `OS Version: ${unameSR}`,
-    modelDescription,
-    knowledgeCutoffMessage,
-    process.env.USER_TYPE === 'ant' && isUndercover()
-      ? null
-      : `The most recent Claude model family is Claude 4.5/4.6. Model IDs — Opus 4.6: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.opus}', Sonnet 4.6: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.sonnet}', Haiku 4.5: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.haiku}'. When building AI applications, default to the latest and most capable Claude models.`,
-    process.env.USER_TYPE === 'ant' && isUndercover()
-      ? null
-      : `Claude Code is available as a CLI in the terminal, desktop app (Mac/Windows), web app (claude.ai/code), and IDE extensions (VS Code, JetBrains).`,
-    process.env.USER_TYPE === 'ant' && isUndercover()
-      ? null
-      : `Fast mode for Claude Code uses the same ${FRONTIER_MODEL_NAME} model with faster output. It does NOT switch to a different model. It can be toggled with /fast.`,
+    // modelDescription,
+    // knowledgeCutoffMessage,
+    // process.env.USER_TYPE === 'ant' && isUndercover()
+    //   ? null
+    //   : `The most recent Claude model family is Claude 4.5/4.6. Model IDs — Opus 4.6: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.opus}', Sonnet 4.6: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.sonnet}', Haiku 4.5: '${CLAUDE_4_5_OR_4_6_MODEL_IDS.haiku}'. When building AI applications, default to the latest and most capable Claude models.`,
+    // process.env.USER_TYPE === 'ant' && isUndercover()
+    //   ? null
+    //   : `Claude Code is available as a CLI in the terminal, desktop app (Mac/Windows), web app (claude.ai/code), and IDE extensions (VS Code, JetBrains).`,
+    // process.env.USER_TYPE === 'ant' && isUndercover()
+    //   ? null
+    //   : `Fast mode for Claude Code uses the same ${FRONTIER_MODEL_NAME} model with faster output. It does NOT switch to a different model. It can be toggled with /fast.`,
   ].filter(item => item !== null)
 
   return [
