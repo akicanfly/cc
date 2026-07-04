@@ -26,12 +26,18 @@ export function getEffortNotificationText(
 
 export function effortLevelToSymbol(level: EffortLevel): string {
   switch (level) {
+    case 'none':
+      return EFFORT_LOW
+    case 'minimal':
+      return EFFORT_LOW
     case 'low':
       return EFFORT_LOW
     case 'medium':
       return EFFORT_MEDIUM
     case 'high':
       return EFFORT_HIGH
+    case 'xhigh':
+      return EFFORT_MAX
     case 'max':
       return EFFORT_MAX
     default:

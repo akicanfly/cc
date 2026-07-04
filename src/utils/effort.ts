@@ -4,6 +4,8 @@ import { getInitialSettings } from './settings/settings.js'
 import { isProSubscriber, isMaxSubscriber, isTeamSubscriber } from './auth.js'
 import { getFeatureValue_CACHED_MAY_BE_STALE } from 'src/services/analytics/growthbook.js'
 import { getAPIProvider } from './model/providers.js'
+import { getVariantBlob } from './effort/modelVariants.js'
+import type { VariantID } from './effort/variantTypes.js'
 import { get3PModelCapabilityOverride } from './model/modelSupportOverrides.js'
 import { isEnvTruthy } from './envUtils.js'
 import type { EffortLevel } from 'src/entrypoints/sdk/runtimeTypes.js'
@@ -11,9 +13,12 @@ import type { EffortLevel } from 'src/entrypoints/sdk/runtimeTypes.js'
 export type { EffortLevel }
 
 export const EFFORT_LEVELS = [
+  'none',
+  'minimal',
   'low',
   'medium',
   'high',
+  'xhigh',
   'max',
 ] as const satisfies readonly EffortLevel[]
 
@@ -22,6 +27,9 @@ export type EffortValue = EffortLevel | number
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports the effort parameter.
 export function modelSupportsEffort(model: string): boolean {
   const m = model.toLowerCase()
+  if (process.env.OPENAI_COMPATIBLE_BASE_URL || process.env.OPENAI_BASE_URL) {
+    return true
+  }
   if (isEnvTruthy(process.env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT)) {
     return true
   }
@@ -51,6 +59,9 @@ export function modelSupportsEffort(model: string): boolean {
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports 'max' effort.
 // Per API docs, 'max' is Opus 4.6 only for public models — other models return an error.
 export function modelSupportsMaxEffort(model: string): boolean {
+  if (process.env.OPENAI_COMPATIBLE_BASE_URL || process.env.OPENAI_BASE_URL) {
+    return true
+  }
   const supported3P = get3PModelCapabilityOverride(model, 'max_effort')
   if (supported3P !== undefined) {
     return supported3P
@@ -95,10 +106,7 @@ export function parseEffortValue(value: unknown): EffortValue | undefined {
 export function toPersistableEffort(
   value: EffortValue | undefined,
 ): EffortLevel | undefined {
-  if (value === 'low' || value === 'medium' || value === 'high') {
-    return value
-  }
-  if (value === 'max' && process.env.USER_TYPE === 'ant') {
+  if (typeof value === 'string' && isEffortLevel(value)) {
     return value
   }
   return undefined
@@ -159,6 +167,9 @@ export function resolveAppliedEffort(
   }
   const resolved =
     envOverride ?? appStateEffortValue ?? getDefaultEffortForModel(model)
+  if (typeof resolved === 'string' && !getVariantBlob(model, resolved as VariantID)) {
+    return getVariantBlob(model, 'high') ? 'high' : undefined
+  }
   // API rejects 'max' on non-Opus-4.6 models — downgrade to 'high'.
   if (resolved === 'max' && !modelSupportsMaxEffort(model)) {
     return 'high'
@@ -223,14 +234,20 @@ export function convertEffortValueToLevel(value: EffortValue): EffortLevel {
  */
 export function getEffortLevelDescription(level: EffortLevel): string {
   switch (level) {
+    case 'none':
+      return 'Disable provider reasoning when supported'
+    case 'minimal':
+      return 'Use the smallest provider reasoning effort when supported'
     case 'low':
       return 'Quick, straightforward implementation with minimal overhead'
     case 'medium':
       return 'Balanced approach with standard implementation and testing'
     case 'high':
       return 'Comprehensive implementation with extensive testing and documentation'
+    case 'xhigh':
+      return 'Extra-high reasoning effort when supported'
     case 'max':
-      return 'Maximum capability with deepest reasoning (Opus 4.6 only)'
+      return 'Maximum capability with deepest reasoning when supported'
   }
 }
 

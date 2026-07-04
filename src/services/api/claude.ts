@@ -100,6 +100,7 @@ import {
   extractQuotaStatusFromHeaders,
 } from '../claudeAiLimits.js'
 import { getAPIContextManagement } from '../compact/apiMicrocompact.js'
+import { lowerThinking } from './effort/lowerThinking.js'
 
 /* eslint-disable @typescript-eslint/no-require-imports */
 const autoModeStateModule = feature('TRANSCRIPT_CLASSIFIER')
@@ -134,7 +135,6 @@ import {
   AFK_MODE_BETA_HEADER,
   CONTEXT_1M_BETA_HEADER,
   CONTEXT_MANAGEMENT_BETA_HEADER,
-  EFFORT_BETA_HEADER,
   FAST_MODE_BETA_HEADER,
   PROMPT_CACHING_SCOPE_BETA_HEADER,
   REDACT_THINKING_BETA_HEADER,
@@ -164,9 +164,11 @@ import {
 import { CLAUDE_IN_CHROME_MCP_SERVER_NAME } from 'src/utils/claudeInChrome/common.js'
 import { CHROME_TOOL_SEARCH_INSTRUCTIONS } from 'src/utils/claudeInChrome/prompt.js'
 import { getMaxThinkingTokensForModel } from 'src/utils/context.js'
+import { getVariantBlob } from 'src/utils/effort/modelVariants.js'
+import type { VariantBlob, VariantID } from 'src/utils/effort/variantTypes.js'
 import { logForDebugging } from 'src/utils/debug.js'
 import { logForDiagnosticsNoPII } from 'src/utils/diagLogs.js'
-import { type EffortValue, modelSupportsEffort } from 'src/utils/effort.js'
+import { type EffortValue } from 'src/utils/effort.js'
 import {
   isFastModeAvailable,
   isFastModeCooldown,
@@ -178,11 +180,7 @@ import { headlessProfilerCheckpoint } from 'src/utils/headlessProfiler.js'
 import { isMcpInstructionsDeltaEnabled } from 'src/utils/mcpInstructionsDelta.js'
 import { calculateUSDCost } from 'src/utils/modelCost.js'
 import { endQueryProfile, queryCheckpoint } from 'src/utils/queryProfiler.js'
-import {
-  modelSupportsAdaptiveThinking,
-  modelSupportsThinking,
-  type ThinkingConfig,
-} from 'src/utils/thinking.js'
+import { modelSupportsThinking, type ThinkingConfig } from 'src/utils/thinking.js'
 import {
   extractDiscoveredToolNames,
   isDeferredToolsDeltaEnabled,
@@ -433,36 +431,55 @@ function should1hCacheTTL(querySource?: QuerySource): boolean {
   )
 }
 
-/**
- * Configure effort parameters for API request.
- *
- */
-function configureEffortParams(
+function configureNumericEffortOverride(
   effortValue: EffortValue | undefined,
-  outputConfig: BetaOutputConfig,
   extraBodyParams: Record<string, unknown>,
-  betas: string[],
-  model: string,
 ): void {
-  if (!modelSupportsEffort(model) || 'effort' in outputConfig) {
-    return
-  }
+  if (typeof effortValue !== 'number' || process.env.USER_TYPE !== 'ant') return
 
-  if (effortValue === undefined) {
-    betas.push(EFFORT_BETA_HEADER)
-  } else if (typeof effortValue === 'string') {
-    // Send string effort level as is
-    outputConfig.effort = effortValue
-    betas.push(EFFORT_BETA_HEADER)
-  } else if (process.env.USER_TYPE === 'ant') {
-    // Numeric effort override - ant-only (uses anthropic_internal)
-    const existingInternal =
-      (extraBodyParams.anthropic_internal as Record<string, unknown>) || {}
-    extraBodyParams.anthropic_internal = {
-      ...existingInternal,
-      effort_override: effortValue,
+  const existingInternal =
+    (extraBodyParams.anthropic_internal as Record<string, unknown>) || {}
+  extraBodyParams.anthropic_internal = {
+    ...existingInternal,
+    effort_override: effortValue,
+  }
+}
+
+function withThinkingConfigOverride(
+  model: string,
+  blob: VariantBlob,
+  thinkingConfig: ThinkingConfig,
+  maxOutputTokens: number,
+): VariantBlob {
+  const thinking = blob.thinking as Record<string, unknown> | undefined
+  if (
+    thinking?.type === 'adaptive' &&
+    isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING)
+  ) {
+    return {
+      ...blob,
+      thinking: {
+        type: 'enabled',
+        budgetTokens: getMaxThinkingTokensForModel(model),
+      },
     }
   }
+
+  if (
+    thinkingConfig.type === 'enabled' &&
+    thinkingConfig.budgetTokens !== undefined &&
+    thinking?.type === 'enabled'
+  ) {
+    return {
+      ...blob,
+      thinking: {
+        ...thinking,
+        budgetTokens: Math.min(maxOutputTokens - 1, thinkingConfig.budgetTokens),
+      },
+    }
+  }
+
+  return blob
 }
 
 // output_config.task_budget — API-side token budget awareness for the model.
@@ -1560,13 +1577,7 @@ async function* queryModel(
       ...((extraBodyParams.output_config as BetaOutputConfig) ?? {}),
     }
 
-    configureEffortParams(
-      effort,
-      outputConfig,
-      extraBodyParams,
-      betasParams,
-      options.model,
-    )
+    configureNumericEffortOverride(effort, extraBodyParams)
 
     configureTaskBudgetParams(
       options.taskBudget,
@@ -1593,39 +1604,34 @@ async function* queryModel(
       options.maxOutputTokensOverride ||
       getMaxOutputTokensForModel(options.model)
 
-    const hasThinking =
+    const shouldRequestThinking =
       thinkingConfig.type !== 'disabled' &&
       !isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_THINKING)
     let thinking: BetaMessageStreamParams['thinking'] | undefined = undefined
+    let hasThinking = false
 
-    // IMPORTANT: Do not change the adaptive-vs-budget thinking selection below
-    // without notifying the model launch DRI and research. This is a sensitive
-    // setting that can greatly affect model quality and bashing.
-    if (hasThinking && modelSupportsThinking(options.model)) {
-      if (
-        !isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_ADAPTIVE_THINKING) &&
-        modelSupportsAdaptiveThinking(options.model)
-      ) {
-        // For models that support adaptive thinking, always use adaptive
-        // thinking without a budget.
-        thinking = {
-          type: 'adaptive',
-        } satisfies BetaMessageStreamParams['thinking']
-      } else {
-        // For models that do not support adaptive thinking, use the default
-        // thinking budget unless explicitly specified.
-        let thinkingBudget = getMaxThinkingTokensForModel(options.model)
-        if (
-          thinkingConfig.type === 'enabled' &&
-          thinkingConfig.budgetTokens !== undefined
-        ) {
-          thinkingBudget = thinkingConfig.budgetTokens
-        }
-        thinkingBudget = Math.min(maxOutputTokens - 1, thinkingBudget)
-        thinking = {
-          budget_tokens: thinkingBudget,
-          type: 'enabled',
-        } satisfies BetaMessageStreamParams['thinking']
+    if (shouldRequestThinking && modelSupportsThinking(options.model)) {
+      const effortVariant = typeof effort === 'string' ? effort : 'high'
+      const variantBlob = getVariantBlob(options.model, effortVariant as VariantID)
+      const loweredThinking = lowerThinking(
+        { model: options.model, maxOutputTokens },
+        'anthropic_native',
+        variantBlob
+          ? withThinkingConfigOverride(
+              options.model,
+              variantBlob,
+              thinkingConfig,
+              maxOutputTokens,
+            )
+          : undefined,
+      )
+
+      thinking = loweredThinking.thinking
+      hasThinking = thinking !== undefined
+      Object.assign(outputConfig, loweredThinking.outputConfig)
+      Object.assign(extraBodyParams, loweredThinking.extraBodyParams)
+      for (const beta of loweredThinking.betas ?? []) {
+        if (!betasParams.includes(beta)) betasParams.push(beta)
       }
     }
 

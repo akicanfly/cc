@@ -1,6 +1,9 @@
 import type { ClientOptions } from '@anthropic-ai/sdk'
 import type { BetaMessageStreamParams } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
 import { randomUUID } from 'crypto'
+import { lowerThinking } from './effort/lowerThinking.js'
+import { getVariantBlob } from 'src/utils/effort/modelVariants.js'
+import { isVariantID } from 'src/utils/effort/variantTypes.js'
 
 type AnthropicStreamEvent = {
   type: string
@@ -55,6 +58,7 @@ type OpenAIChatRequest = {
   temperature?: number
   top_p?: number
   stop?: string[]
+  reasoning_effort?: string
 }
 
 type OpenAIChatCompletion = {
@@ -339,6 +343,16 @@ function parseHeaders(raw: string | undefined): Record<string, string> {
 
 function toOpenAIRequest(params: BetaMessageStreamParams, stream: boolean): OpenAIChatRequest {
   const toolChoice = toOpenAIToolChoice(params.tool_choice)
+  const requestedEffort = params.output_config?.effort
+  const variantBlob =
+    typeof requestedEffort === 'string' && isVariantID(requestedEffort)
+      ? getVariantBlob(params.model, requestedEffort)
+      : undefined
+  const loweredThinking = lowerThinking(
+    { model: params.model, maxOutputTokens: params.max_tokens },
+    'openai_compatible',
+    variantBlob,
+  )
   return {
     model: params.model,
     stream,
@@ -353,6 +367,7 @@ function toOpenAIRequest(params: BetaMessageStreamParams, stream: boolean): Open
     ...(params.temperature !== undefined ? { temperature: params.temperature } : {}),
     ...(params.top_p !== undefined ? { top_p: params.top_p } : {}),
     ...(params.stop_sequences?.length ? { stop: params.stop_sequences } : {}),
+    ...loweredThinking.extraBodyParams,
   }
 }
 
@@ -448,6 +463,8 @@ function fromOpenAIStream(
     }
 
     let nextBlockIndex = 0
+    let reasoningBlockIndex: number | undefined
+    let reasoningBlockOpen = false
     let textBlockIndex: number | undefined
     let textualToolCandidate = ''
     let stopReason: string | null = null
@@ -462,7 +479,23 @@ function fromOpenAIStream(
       const delta = choice?.delta
       if (!delta) continue
 
+      if (delta.reasoning_content) {
+        const previousIndex = reasoningBlockIndex
+        reasoningBlockIndex = yield* yieldReasoningDelta(
+          delta.reasoning_content,
+          reasoningBlockIndex,
+          nextBlockIndex,
+        )
+        reasoningBlockOpen = true
+        if (previousIndex === undefined) nextBlockIndex += 1
+      }
+
       if (delta.content) {
+        if (reasoningBlockOpen && reasoningBlockIndex !== undefined) {
+          yield { type: 'content_block_stop', index: reasoningBlockIndex }
+          reasoningBlockOpen = false
+          reasoningBlockIndex = undefined
+        }
         const candidate = textualToolCandidate + delta.content
         if (textBlockIndex === undefined && tools.size === 0 && isPotentialTextualToolCall(candidate)) {
           textualToolCandidate = candidate
@@ -479,6 +512,11 @@ function fromOpenAIStream(
       }
 
       for (const toolDelta of delta.tool_calls ?? []) {
+        if (reasoningBlockOpen && reasoningBlockIndex !== undefined) {
+          yield { type: 'content_block_stop', index: reasoningBlockIndex }
+          reasoningBlockOpen = false
+          reasoningBlockIndex = undefined
+        }
         const events = appendToolDelta(tools, toolDelta, nextBlockIndex)
         if (events.started) nextBlockIndex += 1
         for (const event of events.events) yield event
@@ -505,6 +543,7 @@ function fromOpenAIStream(
       if (previousIndex === undefined) nextBlockIndex += 1
     }
 
+    if (reasoningBlockOpen && reasoningBlockIndex !== undefined) yield { type: 'content_block_stop', index: reasoningBlockIndex }
     if (textBlockIndex !== undefined) yield { type: 'content_block_stop', index: textBlockIndex }
     for (const tool of tools.values()) {
       if (tool.started) yield { type: 'content_block_stop', index: tool.blockIndex }
@@ -518,6 +557,19 @@ function fromOpenAIStream(
   })() as unknown as AsyncIterable<AnthropicStreamEvent> & { controller: AbortController }
   stream.controller = controller
   return stream
+}
+
+function* yieldReasoningDelta(
+  text: string,
+  existingIndex: number | undefined,
+  nextBlockIndex: number,
+): Generator<AnthropicStreamEvent, number> {
+  const index = existingIndex ?? nextBlockIndex
+  if (existingIndex === undefined) {
+    yield { type: 'content_block_start', index, content_block: { type: 'thinking', thinking: '' } }
+  }
+  yield { type: 'content_block_delta', index, delta: { type: 'thinking_delta', thinking: text } }
+  return index
 }
 
 function* yieldTextDelta(

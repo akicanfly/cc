@@ -20,7 +20,6 @@ import {
   type EffortLevel,
   getDefaultEffortForModel,
   modelSupportsEffort,
-  modelSupportsMaxEffort,
   resolvePickerEffortPersistence,
   toPersistableEffort,
 } from '../utils/effort.js'
@@ -134,9 +133,8 @@ export function ModelPicker({
   const focusedModelName = filteredOptions.find(opt => opt.value === focusedValue)?.label
   const focusedModel = resolveOptionModel(focusedValue)
   const focusedSupportsEffort = focusedModel ? modelSupportsEffort(focusedModel) : false
-  const focusedSupportsMax = focusedModel ? modelSupportsMaxEffort(focusedModel) : false
   const focusedDefaultEffort = getDefaultEffortLevelForOption(focusedValue)
-  const displayEffort = effort === 'max' && !focusedSupportsMax ? 'high' : effort
+  const displayEffort = effort
 
   const handleFocus = (value: string) => {
     setFocusedValue(value)
@@ -146,7 +144,7 @@ export function ModelPicker({
   }
   const handleCycleEffort = (direction: 'left' | 'right') => {
     if (!focusedSupportsEffort) return
-    setEffort(prev => cycleEffortLevel(prev ?? focusedDefaultEffort, direction, focusedSupportsMax))
+    setEffort(prev => cycleEffortLevel(prev ?? focusedDefaultEffort, direction))
     setHasToggledEffort(true)
   }
   useKeybindings(
@@ -286,9 +284,8 @@ function EffortLevelIndicator({ effort }: { effort: EffortLevel | undefined }) {
 function cycleEffortLevel(
   current: EffortLevel,
   direction: 'left' | 'right',
-  includeMax: boolean,
 ): EffortLevel {
-  const levels: EffortLevel[] = includeMax ? ['low', 'medium', 'high', 'max'] : ['low', 'medium', 'high']
+  const levels: EffortLevel[] = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']
   const idx = levels.indexOf(current)
   const currentIndex = idx !== -1 ? idx : levels.indexOf('high')
   return direction === 'right'

@@ -111,7 +111,7 @@ export function executeEffort(args: string): EffortCommandResult {
   }
   if (!isEffortLevel(normalized)) {
     return {
-      message: `Invalid argument: ${args}. Valid options are: low, medium, high, max, auto`
+      message: `Invalid argument: ${args}. Valid options are: none, minimal, low, medium, high, xhigh, max, auto`
     };
   }
   return setEffortValue(normalized);
