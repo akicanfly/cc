@@ -1,5 +1,5 @@
 export const defines: Record<string, string> = {
-  'MACRO.VERSION': '"1.0.34"',
+  'MACRO.VERSION': '"2.1.88"',
   'MACRO.BUILD_TIMESTAMP': '"2026-03-31"',
   'MACRO.BUILD_TIME': '"2026-03-31T12:00:00Z"',
   'MACRO.FEEDBACK_CHANNEL': '"#claude-code-feedback"',
