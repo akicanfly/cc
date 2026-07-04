@@ -1,0 +1,7 @@
+{
+  "name": "google-auth-library",
+  "version": "0.0.0-stub",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "type": "module"
+}

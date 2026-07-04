@@ -5,6 +5,7 @@ const result = await Bun.build({
   target: 'bun',
   outdir: 'dist',
   define: defines,
+  minify: true,
 })
 
 if (!result.success) {

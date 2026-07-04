@@ -1,0 +1,7 @@
+export class OTLPLogExporter {
+  constructor() {
+    throw new Error(
+      '@opentelemetry/exporter-logs-otlp-proto is not included in this build.'
+    )
+  }
+}
