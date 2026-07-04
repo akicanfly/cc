@@ -4,6 +4,7 @@ node_modules/
 # Build output
 dist/
 build/
+original/
 
 # Bun
 bun.lockb
@@ -30,3 +31,4 @@ Thumbs.db
 
 # TypeScript
 *.tsbuildinfo
+.claude/
