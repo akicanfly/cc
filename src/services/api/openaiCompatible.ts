@@ -2,6 +2,12 @@ import type { ClientOptions } from '@anthropic-ai/sdk'
 import type { BetaMessageStreamParams } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
 import { randomUUID } from 'crypto'
 import { lowerThinking } from './effort/lowerThinking.js'
+import {
+  createOpenAICompatibleResponseError,
+  createOpenAICompatibleStreamError,
+  isOpenAIErrorPayload,
+  type OpenAIErrorPayload,
+} from './openaiCompatibleErrors.js'
 import { getVariantBlob } from 'src/utils/effort/modelVariants.js'
 import { isVariantID } from 'src/utils/effort/variantTypes.js'
 
@@ -139,9 +145,7 @@ export async function listOpenAICompatibleModels(): Promise<string[]> {
   )
 
   if (!response.ok) {
-    throw new Error(
-      `OpenAI-compatible models request failed (${response.status}): ${await safeErrorBody(response)}`,
-    )
+    throw await createOpenAICompatibleResponseError(response, 'models request')
   }
 
   const parsed = (await response.json()) as { data?: Array<{ id?: string }> }
@@ -291,9 +295,7 @@ async function postOpenAIChatCompletion({
     )
 
     if (!response.ok) {
-      throw new Error(
-        `OpenAI-compatible request failed (${response.status}): ${await safeErrorBody(response)}`,
-      )
+      throw await createOpenAICompatibleResponseError(response, 'chat completion request')
     }
     return response
   } finally {
@@ -473,6 +475,9 @@ function fromOpenAIStream(
 
     for await (const frame of readSSE(body)) {
       const parsed = parseOpenAIChunk(frame)
+      if (isOpenAIErrorPayload(parsed)) {
+        throw createOpenAICompatibleStreamError(parsed)
+      }
       if (parsed.usage) usage = toAnthropicUsage(parsed.usage)
       const choice = parsed.choices?.[0]
       if (choice?.finish_reason) stopReason = mapStopReason(choice.finish_reason)
@@ -690,9 +695,9 @@ function* parseSSEEvent(event: string): Generator<string> {
   if (data && data !== '[DONE]') yield data
 }
 
-function parseOpenAIChunk(frame: string): OpenAIChunk {
+function parseOpenAIChunk(frame: string): OpenAIChunk | OpenAIErrorPayload {
   try {
-    return JSON.parse(frame) as OpenAIChunk
+    return JSON.parse(frame) as OpenAIChunk | OpenAIErrorPayload
   } catch (error) {
     throw new Error(`OpenAI-compatible stream returned invalid JSON chunk: ${error instanceof Error ? error.message : String(error)}`)
   }
@@ -777,8 +782,3 @@ function timeoutSignal(timeoutMs: number): AbortSignal {
   return controller.signal
 }
 
-async function safeErrorBody(response: Response): Promise<string> {
-  const text = await response.text().catch(() => response.statusText)
-  const sanitized = text.trim() || response.statusText
-  return sanitized.length > 1_000 ? `${sanitized.slice(0, 1_000)}…` : sanitized
-}
