@@ -8,6 +8,10 @@ import {
   isOpenAIErrorPayload,
   type OpenAIErrorPayload,
 } from './openaiCompatibleErrors.js'
+import {
+  shouldSendOpenAISamplingParams,
+  shouldSendOpenAIStreamOptions,
+} from './openaiCompatibleQuirks.js'
 import { getVariantBlob } from 'src/utils/effort/modelVariants.js'
 import { isVariantID } from 'src/utils/effort/variantTypes.js'
 
@@ -31,16 +35,15 @@ type OpenAIToolChoice =
   | 'required'
   | { type: 'function'; function: { name: string } }
 
+type OpenAIUserContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } }
+
 type OpenAIMessage =
   | { role: 'system'; content: string }
   | {
       role: 'user'
-      content:
-        | string
-        | Array<
-            | { type: 'text'; text: string }
-            | { type: 'image_url'; image_url: { url: string } }
-          >
+      content: string | OpenAIUserContentPart[]
     }
   | {
       role: 'assistant'
@@ -83,14 +86,24 @@ type OpenAIChatCompletion = {
   usage?: OpenAIUsage
 }
 
+type OpenAIContentPart = {
+  type?: string | null
+  text?: string | null
+  thinking?: string | Array<{ type?: string | null; text?: string | null }> | null
+}
+
+type OpenAIChunkDelta = {
+  content?: string | OpenAIContentPart[] | null
+  reasoning_content?: string | null
+  reasoning?: string | null
+  tool_calls?: OpenAIToolCallDelta[] | null
+}
+
 type OpenAIChunk = {
   id?: string
   choices?: Array<{
-    delta?: {
-      content?: string | null
-      reasoning_content?: string | null
-      tool_calls?: OpenAIToolCallDelta[] | null
-    } | null
+    delta?: OpenAIChunkDelta | null
+    message?: OpenAIChunkDelta | null
     finish_reason?: string | null
   }>
   usage?: OpenAIUsage | null
@@ -290,7 +303,7 @@ async function postOpenAIChatCompletion({
           Authorization: `Bearer ${config.apiKey}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify(toOpenAIRequest(params, stream)),
+        body: JSON.stringify(toOpenAIRequest(params, stream, config)),
       },
     )
 
@@ -343,7 +356,11 @@ function parseHeaders(raw: string | undefined): Record<string, string> {
   }
 }
 
-function toOpenAIRequest(params: BetaMessageStreamParams, stream: boolean): OpenAIChatRequest {
+function toOpenAIRequest(
+  params: BetaMessageStreamParams,
+  stream: boolean,
+  config: OpenAICompatibleConfig,
+): OpenAIChatRequest {
   const toolChoice = toOpenAIToolChoice(params.tool_choice)
   const requestedEffort = params.output_config?.effort
   const variantBlob =
@@ -355,10 +372,11 @@ function toOpenAIRequest(params: BetaMessageStreamParams, stream: boolean): Open
     'openai_compatible',
     variantBlob,
   )
+  const sendSamplingParams = shouldSendOpenAISamplingParams(params.model)
   return {
     model: params.model,
     stream,
-    ...(stream ? { stream_options: { include_usage: true } } : {}),
+    ...(stream && shouldSendOpenAIStreamOptions(config.baseURL) ? { stream_options: { include_usage: true } } : {}),
     messages: [
       ...systemMessages(params.system),
       ...params.messages.flatMap(message => toOpenAIMessages(message)),
@@ -366,8 +384,8 @@ function toOpenAIRequest(params: BetaMessageStreamParams, stream: boolean): Open
     ...(params.tools?.length ? { tools: params.tools.map(toOpenAITool) } : {}),
     ...(toolChoice ? { tool_choice: toolChoice } : {}),
     ...(params.max_tokens !== undefined ? { max_tokens: params.max_tokens } : {}),
-    ...(params.temperature !== undefined ? { temperature: params.temperature } : {}),
-    ...(params.top_p !== undefined ? { top_p: params.top_p } : {}),
+    ...(sendSamplingParams && params.temperature !== undefined ? { temperature: params.temperature } : {}),
+    ...(sendSamplingParams && params.top_p !== undefined ? { top_p: params.top_p } : {}),
     ...(params.stop_sequences?.length ? { stop: params.stop_sequences } : {}),
     ...loweredThinking.extraBodyParams,
   }
@@ -404,42 +422,93 @@ function systemMessages(system: BetaMessageStreamParams['system']): OpenAIMessag
 function toOpenAIMessages(message: BetaMessageStreamParams['messages'][number]): OpenAIMessage[] {
   if (typeof message.content === 'string') return [{ role: message.role, content: message.content }]
 
-  if (message.role === 'assistant') {
-    const text = message.content.filter(block => block.type === 'text').map(block => block.text).join('\n')
-    const toolCalls = message.content.filter(block => block.type === 'tool_use').map(block => ({
-      id: block.id,
-      type: 'function' as const,
-      function: { name: block.name, arguments: stringifyJson(block.input ?? {}) },
-    }))
-    return [{ role: 'assistant', content: text || null, ...(toolCalls.length ? { tool_calls: toolCalls } : {}) }]
+  const content = message.content as Array<{ type: string } & Record<string, unknown>>
+  if (message.role === 'assistant') return toOpenAIAssistantMessages(content)
+  return toOpenAIUserMessages(content)
+}
+
+function toOpenAIAssistantMessages(content: Array<{ type: string } & Record<string, unknown>>): OpenAIMessage[] {
+  const messages: OpenAIMessage[] = []
+  let textParts: string[] = []
+  let toolCalls: NonNullable<Extract<OpenAIMessage, { role: 'assistant' }>['tool_calls']> = []
+
+  const flush = () => {
+    if (!textParts.length && !toolCalls.length) return
+    const text = textParts.join('\n')
+    messages.push({
+      role: 'assistant',
+      content: text || null,
+      ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+    })
+    textParts = []
+    toolCalls = []
   }
 
-  const messages: OpenAIMessage[] = []
-  const contentParts: Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string } }> = []
-  for (const block of message.content) {
-    if (block.type === 'text') contentParts.push({ type: 'text', text: block.text })
-    if (block.type === 'image') {
-      contentParts.push({
-        type: 'image_url',
-        image_url: { url: `data:${block.source.media_type};base64,${block.source.data}` },
+  for (const block of content) {
+    if (block.type === 'text') {
+      if (toolCalls.length) flush()
+      const text = asString(block.text)
+      if (text) textParts.push(text)
+      continue
+    }
+    if (block.type === 'tool_use') {
+      toolCalls.push({
+        id: asString(block.id) ?? `toolu_${randomUUID()}`,
+        type: 'function',
+        function: {
+          name: asString(block.name) ?? 'tool',
+          arguments: stringifyJson(block.input ?? {}),
+        },
       })
     }
   }
-  if (contentParts.length === 1 && contentParts[0]?.type === 'text') {
-    messages.push({ role: 'user', content: contentParts[0].text })
-  } else if (contentParts.length) {
-    messages.push({ role: 'user', content: contentParts })
+
+  flush()
+  return messages.length ? messages : [{ role: 'assistant', content: null }]
+}
+
+function toOpenAIUserMessages(content: Array<{ type: string } & Record<string, unknown>>): OpenAIMessage[] {
+  const messages: OpenAIMessage[] = []
+  let contentParts: OpenAIUserContentPart[] = []
+
+  const flushContent = () => {
+    if (!contentParts.length) return
+    if (contentParts.length === 1 && contentParts[0]?.type === 'text') {
+      messages.push({ role: 'user', content: contentParts[0].text })
+    } else {
+      messages.push({ role: 'user', content: contentParts })
+    }
+    contentParts = []
   }
 
-  for (const block of message.content) {
-    if (block.type !== 'tool_result') continue
-    messages.push({
-      role: 'tool',
-      tool_call_id: block.tool_use_id,
-      content: toolResultContent(block.content),
-    })
+  for (const block of content) {
+    if (block.type === 'text') {
+      contentParts.push({ type: 'text', text: asString(block.text) ?? '' })
+      continue
+    }
+    if (block.type === 'image') {
+      const source = block.source as { media_type?: unknown; data?: unknown } | undefined
+      const mediaType = asString(source?.media_type)
+      const data = asString(source?.data)
+      if (mediaType && data) {
+        contentParts.push({
+          type: 'image_url',
+          image_url: { url: `data:${mediaType};base64,${data}` },
+        })
+      }
+      continue
+    }
+    if (block.type === 'tool_result') {
+      flushContent()
+      messages.push({
+        role: 'tool',
+        tool_call_id: asString(block.tool_use_id) ?? '',
+        content: toolResultContent(block.content),
+      })
+    }
   }
 
+  flushContent()
   return messages.length ? messages : [{ role: 'user', content: '' }]
 }
 
@@ -474,57 +543,60 @@ function fromOpenAIStream(
     const tools = new Map<number, ToolAccumulator>()
 
     for await (const frame of readSSE(body)) {
-      const parsed = parseOpenAIChunk(frame)
-      if (isOpenAIErrorPayload(parsed)) {
-        throw createOpenAICompatibleStreamError(parsed)
-      }
-      if (parsed.usage) usage = toAnthropicUsage(parsed.usage)
-      const choice = parsed.choices?.[0]
-      if (choice?.finish_reason) stopReason = mapStopReason(choice.finish_reason)
-      const delta = choice?.delta
-      if (!delta) continue
-
-      if (delta.reasoning_content) {
-        const previousIndex = reasoningBlockIndex
-        reasoningBlockIndex = yield* yieldReasoningDelta(
-          delta.reasoning_content,
-          reasoningBlockIndex,
-          nextBlockIndex,
-        )
-        reasoningBlockOpen = true
-        if (previousIndex === undefined) nextBlockIndex += 1
-      }
-
-      if (delta.content) {
-        if (reasoningBlockOpen && reasoningBlockIndex !== undefined) {
-          yield { type: 'content_block_stop', index: reasoningBlockIndex }
-          reasoningBlockOpen = false
-          reasoningBlockIndex = undefined
+      for (const parsed of parseOpenAIChunks(frame)) {
+        if (isOpenAIErrorPayload(parsed)) {
+          throw createOpenAICompatibleStreamError(parsed)
         }
-        const candidate = textualToolCandidate + delta.content
-        if (textBlockIndex === undefined && tools.size === 0 && isPotentialTextualToolCall(candidate)) {
-          textualToolCandidate = candidate
-        } else {
-          if (textualToolCandidate) {
-            textBlockIndex = yield* yieldTextDelta(textualToolCandidate, textBlockIndex, nextBlockIndex)
-            if (textBlockIndex === nextBlockIndex) nextBlockIndex += 1
-            textualToolCandidate = ''
-          }
-          const previousIndex = textBlockIndex
-          textBlockIndex = yield* yieldTextDelta(delta.content, textBlockIndex, nextBlockIndex)
+        if (parsed.usage) usage = toAnthropicUsage(parsed.usage)
+        const choice = parsed.choices?.[0]
+        if (choice?.finish_reason) stopReason = mapStopReason(choice.finish_reason)
+        const delta = choice?.delta ?? choice?.message
+        if (!delta) continue
+
+        const reasoning = reasoningDeltaText(delta)
+        if (reasoning) {
+          const previousIndex = reasoningBlockIndex
+          reasoningBlockIndex = yield* yieldReasoningDelta(
+            reasoning,
+            reasoningBlockIndex,
+            nextBlockIndex,
+          )
+          reasoningBlockOpen = true
           if (previousIndex === undefined) nextBlockIndex += 1
         }
-      }
 
-      for (const toolDelta of delta.tool_calls ?? []) {
-        if (reasoningBlockOpen && reasoningBlockIndex !== undefined) {
-          yield { type: 'content_block_stop', index: reasoningBlockIndex }
-          reasoningBlockOpen = false
-          reasoningBlockIndex = undefined
+        const text = textDeltaText(delta)
+        if (text) {
+          if (reasoningBlockOpen && reasoningBlockIndex !== undefined) {
+            yield { type: 'content_block_stop', index: reasoningBlockIndex }
+            reasoningBlockOpen = false
+            reasoningBlockIndex = undefined
+          }
+          const candidate = textualToolCandidate + text
+          if (textBlockIndex === undefined && tools.size === 0 && isPotentialTextualToolCall(candidate)) {
+            textualToolCandidate = candidate
+          } else {
+            if (textualToolCandidate) {
+              textBlockIndex = yield* yieldTextDelta(textualToolCandidate, textBlockIndex, nextBlockIndex)
+              if (textBlockIndex === nextBlockIndex) nextBlockIndex += 1
+              textualToolCandidate = ''
+            }
+            const previousIndex = textBlockIndex
+            textBlockIndex = yield* yieldTextDelta(text, textBlockIndex, nextBlockIndex)
+            if (previousIndex === undefined) nextBlockIndex += 1
+          }
         }
-        const events = appendToolDelta(tools, toolDelta, nextBlockIndex)
-        if (events.started) nextBlockIndex += 1
-        for (const event of events.events) yield event
+
+        for (const toolDelta of delta.tool_calls ?? []) {
+          if (reasoningBlockOpen && reasoningBlockIndex !== undefined) {
+            yield { type: 'content_block_stop', index: reasoningBlockIndex }
+            reasoningBlockOpen = false
+            reasoningBlockIndex = undefined
+          }
+          const events = appendToolDelta(tools, toolDelta, nextBlockIndex)
+          if (events.started) nextBlockIndex += 1
+          for (const event of events.events) yield event
+        }
       }
     }
 
@@ -695,12 +767,51 @@ function* parseSSEEvent(event: string): Generator<string> {
   if (data && data !== '[DONE]') yield data
 }
 
-function parseOpenAIChunk(frame: string): OpenAIChunk | OpenAIErrorPayload {
+function parseOpenAIChunks(frame: string): Array<OpenAIChunk | OpenAIErrorPayload> {
   try {
-    return JSON.parse(frame) as OpenAIChunk | OpenAIErrorPayload
+    return [JSON.parse(frame) as OpenAIChunk | OpenAIErrorPayload]
   } catch (error) {
+    const chunks = frame
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(Boolean)
+    if (chunks.length > 1) {
+      try {
+        return chunks.map(chunk => JSON.parse(chunk) as OpenAIChunk | OpenAIErrorPayload)
+      } catch {
+        // Fall through and report the original parse error below.
+      }
+    }
     throw new Error(`OpenAI-compatible stream returned invalid JSON chunk: ${error instanceof Error ? error.message : String(error)}`)
   }
+}
+
+function reasoningDeltaText(delta: OpenAIChunkDelta): string {
+  return delta.reasoning_content ?? delta.reasoning ?? thinkingContent(delta.content) ?? ''
+}
+
+function textDeltaText(delta: OpenAIChunkDelta): string {
+  const content = delta.content
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content
+    .map(part => (part.type === 'text' ? part.text ?? '' : ''))
+    .filter(Boolean)
+    .join('')
+}
+
+function thinkingContent(content: OpenAIChunkDelta['content']): string | undefined {
+  if (!Array.isArray(content)) return undefined
+  const thinking = content
+    .filter(part => part.type === 'thinking')
+    .flatMap(part => {
+      if (typeof part.thinking === 'string') return [part.thinking]
+      if (Array.isArray(part.thinking)) return part.thinking.map(item => item.text ?? '')
+      return []
+    })
+    .filter(Boolean)
+    .join('')
+  return thinking || undefined
 }
 
 function mapStopReason(reason: string | null | undefined): string {
@@ -717,6 +828,10 @@ function toAnthropicUsage(usage?: OpenAIUsage | null) {
     cache_read_input_tokens: usage?.prompt_tokens_details?.cached_tokens ?? 0,
     cache_creation_input_tokens: 0,
   }
+}
+
+function asString(value: unknown): string | undefined {
+  return typeof value === 'string' ? value : undefined
 }
 
 function parseToolInput(input: string | undefined): unknown {
