@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+    branches: [master, test]
+    tags-ignore: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Compute next version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          BRANCH="${GITHUB_REF#refs/heads/}"
+          # Find the highest existing tag matching this branch's release line.
+          # - master:  vX.Y.Z         (regular)
+          # - test:    vX.Y.Z-test.N  (prerelease counter)
+          if [ "$BRANCH" = "test" ]; then
+            # vX.Y.Z-test.N — increment the .N counter on the most recent -test tag.
+            latest="$(git tag --list 'v*-test.*' --sort=-version:refname | head -n1 || true)"
+            if [ -z "$latest" ]; then
+              # No prior -test tag. Seed from the latest master release if any,
+              # else v0.0.0. The first -test prerelease is then test.1.
+              base="$(git tag --list 'v*' --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)"
+              if [ -z "$base" ]; then
+                next="v0.0.1-test.1"
+              else
+                next="${base}-test.1"
+              fi
+            else
+              counter="${latest##*.}"
+              base="${latest%-test.*}"
+              next="${base}-test.$((counter + 1))"
+            fi
+            prerelease="true"
+          else
+            # master: simple patch bump on vX.Y.Z
+            latest="$(git tag --list 'v*' --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)"
+            if [ -z "$latest" ]; then
+              next="v0.0.1"
+            else
+              # Strip leading v, split on ., bump last segment.
+              ver="${latest#v}"
+              IFS='.' read -r major minor patch <<<"$ver"
+              next="v${major}.${minor}.$((patch + 1))"
+            fi
+            prerelease="false"
+          fi
+          echo "version=$next" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "Branch=$BRANCH -> $next (prerelease=$prerelease)"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build & bundle
+        run: bun run build
+
+      - name: Build standalone binaries
+        strategy:
+          fail-fast: false
+          matrix:
+            include:
+              - target: bun-linux-x64
+                suffix: linux-x64
+                outfile: dist/bin/cc-linux-x64
+              - target: bun-linux-arm64
+                suffix: linux-arm64
+                outfile: dist/bin/cc-linux-arm64
+              - target: bun-linux-x64-musl
+                suffix: linux-x64-musl
+                outfile: dist/bin/cc-linux-x64-musl
+              - target: bun-linux-arm64-musl
+                suffix: linux-arm64-musl
+                outfile: dist/bin/cc-linux-arm64-musl
+              - target: bun-windows-x64
+                suffix: windows-x64.exe
+                outfile: dist/bin/cc-windows-x64.exe
+        env:
+          BUN_COMPILE_TARGET: ${{ matrix.target }}
+          BUN_COMPILE_OUTFILE: ${{ matrix.outfile }}
+        run: bun run build:compile
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cc-${{ steps.version.outputs.version }}
+          path: |
+            dist/bin/cc-linux-x64
+            dist/bin/cc-linux-arm64
+            dist/bin/cc-linux-x64-musl
+            dist/bin/cc-linux-arm64-musl
+            dist/bin/cc-windows-x64.exe
+          if-no-files-found: error
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: ${{ steps.version.outputs.version }}
+          prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          files: |
+            dist/bin/cc-linux-x64
+            dist/bin/cc-linux-arm64
+            dist/bin/cc-linux-x64-musl
+            dist/bin/cc-linux-arm64-musl
+            dist/bin/cc-windows-x64.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

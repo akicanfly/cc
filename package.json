@@ -5,9 +5,11 @@
   "private": true,
   "scripts": {
     "build": "bun scripts/build.ts",
+    "build:compile": "bun scripts/build.ts -- --compile",
     "dev": "bun scripts/dev.ts",
     "start": "bun run dist/cli.js",
-    "version": "bun run dist/cli.js --version"
+    "version": "bun run dist/cli.js --version",
+    "install:cc": "bun run build:compile && bun scripts/install.ts"
   },
   "dependencies": {
     "@alcalzone/ansi-tokenize": "*",
