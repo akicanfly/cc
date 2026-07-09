@@ -9,11 +9,6 @@ on:
     # trigger self-documenting.
     tags-ignore: ['v*']
 
-# Defensive: refuse to run on non-push events. If a future change adds
-# pull_request (or any other trigger) to the `on:` list, this guard prevents
-# the release job from creating a release on every PR.
-if: github.event_name == 'push'
-
 concurrency:
   # Serialise releases across pushes. Newer pushes wait for the in-flight
   # release to finish — cancel-in-progress: false because we never want to
@@ -138,6 +133,10 @@ jobs:
     needs: [version, build]
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Defensive: refuse to publish on non-push events. The trigger is already
+    # `on.push:` only, but if anyone later adds `pull_request` to `on:`, this
+    # guard prevents creating a release on every PR.
+    if: github.event_name == 'push'
     permissions:
       contents: write
     steps:
