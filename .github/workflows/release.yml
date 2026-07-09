@@ -3,15 +3,31 @@ name: Release
 on:
   push:
     branches: [master, test]
+    # Defensive: ignore tag pushes even though `branches:` already filters
+    # them out. The version job's `git tag --list` reads the same tags, so
+    # silently pushing a `v*` tag would still be safe — but this keeps the
+    # trigger self-documenting.
     tags-ignore: ['v*']
 
-permissions:
-  contents: write
+# Defensive: refuse to run on non-push events. If a future change adds
+# pull_request (or any other trigger) to the `on:` list, this guard prevents
+# the release job from creating a release on every PR.
+if: github.event_name == 'push'
+
+concurrency:
+  # Serialise releases across pushes. Newer pushes wait for the in-flight
+  # release to finish — cancel-in-progress: false because we never want to
+  # abandon a partially-shipping release.
+  group: release
+  cancel-in-progress: false
 
 jobs:
   version:
     name: Compute version
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
     outputs:
       version: ${{ steps.compute.outputs.version }}
       prerelease: ${{ steps.compute.outputs.prerelease }}
@@ -61,6 +77,9 @@ jobs:
     name: Build ${{ matrix.target }}
     needs: version
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -78,12 +97,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          # Build job only needs the working tree, not history. The version
+          # job above is the one that needs fetch-depth: 0 for tag reads.
+          fetch-depth: 1
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+
+      - name: Setup bun cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
 
       - name: Install dependencies
         run: bun install --frozen-lockfile
@@ -108,12 +137,63 @@ jobs:
     name: Publish release
     needs: [version, build]
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - name: Download all binaries
         uses: actions/download-artifact@v4
         with:
           path: dist/bin
           merge-multiple: true
+
+      # Gate the release on all 5 expected outfiles being present. Without
+      # this, a partial-failure matrix (e.g. 4/5 builds succeed) would still
+      # ship a release tagged as the full version with one binary missing.
+      # The list MUST match the build matrix `outfile` values above; if you
+      # add a matrix entry, add it here too.
+      - name: Verify all binaries are present
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=(
+            "dist/bin/cc-linux-x64"
+            "dist/bin/cc-linux-arm64"
+            "dist/bin/cc-linux-x64-musl"
+            "dist/bin/cc-linux-arm64-musl"
+            "dist/bin/cc-windows-x64.exe"
+          )
+          missing=()
+          for f in "${expected[@]}"; do
+            if [ ! -f "$f" ]; then
+              missing+=("$f")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "error: ${#missing[@]} binary/binarie(s) missing from the download:"
+            for m in "${missing[@]}"; do
+              echo "  - $m"
+            done
+            echo "refusing to publish a partial release. Check the build matrix for failures."
+            exit 1
+          fi
+          echo "all ${#expected[@]} binaries present."
+
+      # Refuse to silently reuse an existing tag. softprops/action-gh-release
+      # reuses a tag if one matches tag_name; the version job computes `next`
+      # from the latest tag, but doesn't check that `next` doesn't already
+      # exist (e.g. from a different branch's history).
+      - name: Verify tag does not already exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ needs.version.outputs.version }}"
+          if git rev-parse --verify "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "error: tag ${tag} already exists. Refusing to reuse."
+            git log --oneline -1 "refs/tags/${tag}" || true
+            exit 1
+          fi
+          echo "tag ${tag} is new."
 
       - name: Create release
         uses: softprops/action-gh-release@v2

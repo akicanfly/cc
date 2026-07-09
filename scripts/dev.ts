@@ -1,8 +1,8 @@
-import { defines } from './macros'
+import { ENTRYPOINT, defines } from './macros'
 
 const defineArgs = Object.entries(defines).flatMap(([k, v]) => ['--define', `${k}=${v}`])
 
-const args = [...defineArgs, 'src/entrypoints/cli.tsx', ...process.argv.slice(2)]
+const args = [...defineArgs, ENTRYPOINT, ...process.argv.slice(2)]
 
 const proc = Bun.spawn(['bun', ...args], {
   stdout: 'inherit',

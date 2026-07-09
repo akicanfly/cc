@@ -9,7 +9,8 @@
     "dev": "bun scripts/dev.ts",
     "start": "bun run dist/cli.js",
     "version": "bun run dist/cli.js --version",
-    "install:cc": "bun run build:compile && bun scripts/install.ts"
+    "install:cc": "bun run build:compile && bun scripts/install.ts",
+    "uninstall:cc": "bun scripts/install.ts --uninstall"
   },
   "dependencies": {
     "@alcalzone/ansi-tokenize": "*",
