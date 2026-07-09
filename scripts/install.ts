@@ -138,12 +138,38 @@ if (uninstall) {
 
 // ---- Target resolution ----------------------------------------------------
 
+function resolveHome(): string | undefined {
+  // POSIX: $HOME. Windows: prefer $USERPROFILE; fall back to $HOMEDRIVE$HOMEPATH
+  // (some minimal Windows envs only set the split vars). Bun does not
+  // synthesize $HOME on Windows, so we can't rely on it being present.
+  if (process.env.HOME) return process.env.HOME
+  if (process.env.USERPROFILE) return process.env.USERPROFILE
+  if (process.env.HOMEDRIVE && process.env.HOMEPATH) {
+    return process.env.HOMEDRIVE + process.env.HOMEPATH
+  }
+  return undefined
+}
+
 function buildCandidates(): string[] {
   if (targetOverride) return [targetOverride]
   const out: string[] = []
   if (process.env.CC_INSTALL_DIR) out.push(process.env.CC_INSTALL_DIR)
-  if (process.env.HOME) out.push(join(process.env.HOME, '.local', 'bin'))
+  const home = resolveHome()
+  if (home) out.push(join(home, '.local', 'bin'))
   if (process.env.PREFIX) out.push(join(process.env.PREFIX, 'bin'))
+  // Windows-specific candidate: per-user Programs dir, matching the layout
+  // used by `npm install -g`, `winget`, and `scoop`. Falls back to
+  // WindowsApps (the UWP-style bin that's always on PATH) when LOCALAPPDATA
+  // is unset. These are appended after the POSIX-style candidates so the
+  // override order remains predictable.
+  if (isWindows) {
+    if (process.env.LOCALAPPDATA) {
+      out.push(join(process.env.LOCALAPPDATA, 'Programs', 'cc', 'bin'))
+    }
+    if (process.env.LOCALAPPDATA) {
+      out.push(join(process.env.LOCALAPPDATA, 'Microsoft', 'WindowsApps'))
+    }
+  }
   return out
 }
 
@@ -151,7 +177,11 @@ const candidates = buildCandidates()
 
 if (candidates.length === 0) {
   console.error('error: no install target resolved.')
-  console.error('hint: pass --target <dir>, or set $CC_INSTALL_DIR, $HOME, or $PREFIX.')
+  if (isWindows) {
+    console.error('hint: pass --target <dir>, or set $CC_INSTALL_DIR, $USERPROFILE, or $LOCALAPPDATA.')
+  } else {
+    console.error('hint: pass --target <dir>, or set $CC_INSTALL_DIR, $HOME, or $PREFIX.')
+  }
   process.exit(1)
 }
 
@@ -365,7 +395,11 @@ function checkPathShadow(target: string): { onPath: boolean; targetDir: string }
         const conflict = found.find(p => resolve(p) !== resolve(target))
         if (conflict) {
           console.warn(`warning: \`cc\` on PATH resolves to ${conflict} (not ${target}).`)
-          console.warn(`  Run \`hash -r\` (POSIX) or restart your shell to refresh the lookup cache.`)
+          if (isWindows) {
+            console.warn(`  Open a new terminal so the new \`cc.exe\` is picked up.`)
+          } else {
+            console.warn(`  Run \`hash -r\` (POSIX) or restart your shell to refresh the lookup cache.`)
+          }
         } else if (found.length > 1) {
           console.warn(`warning: multiple \`cc\` entries on PATH: ${found.join(', ')}`)
         }
@@ -378,6 +412,12 @@ function checkPathShadow(target: string): { onPath: boolean; targetDir: string }
 const pathInfo = checkPathShadow(installedTarget)
 if (!pathInfo.onPath) {
   console.warn(`warning: ${pathInfo.targetDir} is not on $PATH.`)
-  console.warn(`  Add it to your shell rc, e.g.:`)
-  console.warn(`    export PATH="${pathInfo.targetDir}:$PATH"`)
+  if (isWindows) {
+    console.warn(`  Add it to your user PATH, e.g. (PowerShell):`)
+    console.warn(`    [Environment]::SetEnvironmentVariable("Path", "${pathInfo.targetDir};" + $env:Path, "User")`)
+    console.warn(`  Then open a new terminal for the change to take effect.`)
+  } else {
+    console.warn(`  Add it to your shell rc, e.g.:`)
+    console.warn(`    export PATH="${pathInfo.targetDir}:$PATH"`)
+  }
 }

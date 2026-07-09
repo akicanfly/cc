@@ -77,7 +77,10 @@ Removes the binary from the first resolved target directory. The uninstall path 
 | `CC_INSTALL_DIR` | First-preference install directory | unset |
 | `BUN_COMPILE_OUTFILE` | Build output path | `dist/bin/cc[.exe]` |
 | `BUN_COMPILE_TARGET` | Compile target (e.g. `bun-linux-x64`) | `bun` (host arch) |
-| `HOME` | Used for `~/.local/bin` fallback | unset |
+| `HOME` | POSIX home for `~/.local/bin` fallback | unset |
+| `USERPROFILE` | Windows home for `~/.local/bin` fallback (used when `HOME` is unset) | unset |
+| `HOMEDRIVE` / `HOMEPATH` | Windows home split-var fallback (used when `USERPROFILE` is unset) | unset |
+| `LOCALAPPDATA` | Windows; adds `%LOCALAPPDATA%\Programs\cc\bin` and `%LOCALAPPDATA%\Microsoft\WindowsApps` to the candidate list | unset |
 | `PREFIX` | Used for `$PREFIX/bin` fallback (Nix, Termux) | unset |
 
 ## Build Outputs
@@ -90,13 +93,15 @@ Removes the binary from the first resolved target directory. The uninstall path 
 
 ## Cross-Platform Notes
 
-- **Windows**: outfile gets `.exe` suffix automatically; the install target must end up on `%PATH%`. The `chmod` step is skipped.
+- **Windows**: outfile gets `.exe` suffix automatically. The installer reads `USERPROFILE` (or `HOMEDRIVE` + `HOMEPATH` as a fallback) when `HOME` is unset, since PowerShell doesn't set `HOME` by default. Candidate directories, in order: `%USERPROFILE%\.local\bin`, `%LOCALAPPDATA%\Programs\cc\bin`, `%LOCALAPPDATA%\Microsoft\WindowsApps`. The `chmod` step is skipped. If the install target isn't already on `%PATH%`, the installer prints the PowerShell command to add it; remember to open a new terminal for the new `PATH` to take effect.
 - **macOS**: first run after install may be blocked by Gatekeeper if the binary carries a `com.apple.quarantine` xattr. The installer prints the `xattr -d com.apple.quarantine <path>` fix. Run it once to clear the attribute.
 - **Termux / Nix / Guix**: set `PREFIX` to point at the right `bin/` (e.g. `/data/data/com.termux/files/usr` for Termux). If `HOME` resolves to a path that isn't actually on `PATH` (common in Termux), the installer prints a `hash -r` reminder.
 
 ## Troubleshooting
 
 **"source not found"** — run `bun run build:compile` first, or pass `--outfile <path>` to point at an existing binary.
+
+**"no install target resolved"** — on Windows, this usually means neither `HOME` nor `USERPROFILE` is set (rare; PowerShell sets `USERPROFILE` by default). Pass `--target C:\Users\you\bin` explicitly, or set `CC_INSTALL_DIR`. On POSIX, set `HOME` or pass `--target`.
 
 **"size N bytes is suspiciously small"** — the build output is truncated or zero-byte. Re-run the build.
 
