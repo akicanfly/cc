@@ -13,7 +13,10 @@ import {
   shouldSendOpenAIStreamOptions,
 } from './openaiCompatibleQuirks.js'
 import { getVariantBlob } from 'src/utils/effort/modelVariants.js'
+import type { VariantBlob } from 'src/utils/effort/variantTypes.js'
 import { isVariantID } from 'src/utils/effort/variantTypes.js'
+import { getModelDevEntry } from 'src/utils/model/modelsDevCatalog.js'
+import { logForDebugging } from 'src/utils/debug.js'
 
 type AnthropicStreamEvent = {
   type: string
@@ -373,22 +376,84 @@ function toOpenAIRequest(
     variantBlob,
   )
   const sendSamplingParams = shouldSendOpenAISamplingParams(params.model)
+
+  // models.dev enrichment: look up the model's capabilities once per request.
+  // Tri-state booleans: true = use as-is, false = explicitly opt out,
+  // null = unknown, fall through to current behavior. Catalog lookups are
+  // sync (in-memory index) so adding this is free.
+  const dev = getModelDevEntry(params.model)
+  const supportsToolCall = dev?.supportsToolCall
+  const isReasoningModel = dev?.isReasoning === true
+  const reasoningOptions = dev?.reasoningOptions ?? []
+
+  // (a) Default max_tokens: only set when the caller didn't, and only when
+  // the catalog has a real number. Prefer limit.output (the model's actual
+  // output cap); fall back to limit.context minus a small reservation.
+  // 0 / null / undefined -> leave params.max_tokens alone.
+  const maxTokens =
+    params.max_tokens !== undefined
+      ? params.max_tokens
+      : pickDefaultMaxTokens(dev?.maxOutput, dev?.contextWindow)
+
+  // (b) Tool gating: when the catalog explicitly says tool_call=false, omit
+  // the tools field entirely so we don't ship a request the server will
+  // reject. When supportsToolCall is null/true, keep current behavior.
+  const tools =
+    supportsToolCall === false
+      ? undefined
+      : params.tools?.length
+        ? params.tools.map(toOpenAITool)
+        : undefined
+
+  // (c) Reasoning default: for known reasoning models without an explicit
+  // reasoning_effort, pick the first catalog option or 'medium'. The
+  // variantBlob path (output_config.effort -> reasoning_effort) takes
+  // precedence; the catalog path only fills in when that's absent.
+  const variantReasoningEffort = extractReasoningEffortFromVariant(variantBlob)
+  const reasoningEffort =
+    variantReasoningEffort
+      ?? (isReasoningModel
+        ? (reasoningOptions[0] ?? 'medium')
+        : undefined)
+
   return {
     model: params.model,
     stream,
     ...(stream && shouldSendOpenAIStreamOptions(config.baseURL) ? { stream_options: { include_usage: true } } : {}),
     messages: [
       ...systemMessages(params.system),
-      ...params.messages.flatMap(message => toOpenAIMessages(message)),
+      ...params.messages.flatMap(message => toOpenAIMessages(message, dev?.supportsImage === false, params.model)),
     ],
-    ...(params.tools?.length ? { tools: params.tools.map(toOpenAITool) } : {}),
+    ...(tools ? { tools } : {}),
     ...(toolChoice ? { tool_choice: toolChoice } : {}),
-    ...(params.max_tokens !== undefined ? { max_tokens: params.max_tokens } : {}),
+    ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
     ...(sendSamplingParams && params.temperature !== undefined ? { temperature: params.temperature } : {}),
     ...(sendSamplingParams && params.top_p !== undefined ? { top_p: params.top_p } : {}),
     ...(params.stop_sequences?.length ? { stop: params.stop_sequences } : {}),
+    ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
     ...loweredThinking.extraBodyParams,
   }
+}
+
+function pickDefaultMaxTokens(
+  maxOutput: number | null | undefined,
+  contextWindow: number | null | undefined,
+): number | undefined {
+  // Prefer the model's documented output cap. If only context is known,
+  // reserve a generous input share but never exceed 64k (matches
+  // CAPPED_DEFAULT_MAX_TOKENS guardrails in claude.ts).
+  if (typeof maxOutput === 'number' && maxOutput > 0) return maxOutput
+  if (typeof contextWindow === 'number' && contextWindow > 0) {
+    return Math.min(64_000, Math.max(1, Math.floor(contextWindow / 2)))
+  }
+  return undefined
+}
+
+function extractReasoningEffortFromVariant(
+  variantBlob: VariantBlob | undefined,
+): string | undefined {
+  const effort = variantBlob?.reasoningEffort
+  return typeof effort === 'string' && effort.length > 0 ? effort : undefined
 }
 
 function toOpenAITool(tool: NonNullable<BetaMessageStreamParams['tools']>[number]): OpenAIChatTool {
@@ -419,12 +484,16 @@ function systemMessages(system: BetaMessageStreamParams['system']): OpenAIMessag
   return text ? [{ role: 'system', content: text }] : []
 }
 
-function toOpenAIMessages(message: BetaMessageStreamParams['messages'][number]): OpenAIMessage[] {
+function toOpenAIMessages(
+  message: BetaMessageStreamParams['messages'][number],
+  dropImages: boolean,
+  model: string,
+): OpenAIMessage[] {
   if (typeof message.content === 'string') return [{ role: message.role, content: message.content }]
 
   const content = message.content as Array<{ type: string } & Record<string, unknown>>
   if (message.role === 'assistant') return toOpenAIAssistantMessages(content)
-  return toOpenAIUserMessages(content)
+  return toOpenAIUserMessages(content, dropImages, model)
 }
 
 function toOpenAIAssistantMessages(content: Array<{ type: string } & Record<string, unknown>>): OpenAIMessage[] {
@@ -467,9 +536,14 @@ function toOpenAIAssistantMessages(content: Array<{ type: string } & Record<stri
   return messages.length ? messages : [{ role: 'assistant', content: null }]
 }
 
-function toOpenAIUserMessages(content: Array<{ type: string } & Record<string, unknown>>): OpenAIMessage[] {
+function toOpenAIUserMessages(
+  content: Array<{ type: string } & Record<string, unknown>>,
+  dropImages: boolean,
+  model: string,
+): OpenAIMessage[] {
   const messages: OpenAIMessage[] = []
   let contentParts: OpenAIUserContentPart[] = []
+  let droppedImages = 0
 
   const flushContent = () => {
     if (!contentParts.length) return
@@ -487,6 +561,14 @@ function toOpenAIUserMessages(content: Array<{ type: string } & Record<string, u
       continue
     }
     if (block.type === 'image') {
+      // Catalog-driven vision gate: when models.dev explicitly says
+      // supportsImage=false, drop the image rather than letting the server
+      // reject the request. We don't drop on a null (unknown) — that's the
+      // safe default that preserves current behavior.
+      if (dropImages) {
+        droppedImages += 1
+        continue
+      }
       const source = block.source as { media_type?: unknown; data?: unknown } | undefined
       const mediaType = asString(source?.media_type)
       const data = asString(source?.data)
@@ -509,6 +591,11 @@ function toOpenAIUserMessages(content: Array<{ type: string } & Record<string, u
   }
 
   flushContent()
+  if (droppedImages > 0) {
+    logForDebugging(
+      `[openaiCompatible] dropped ${droppedImages} image block(s) for non-vision model ${model}`,
+    )
+  }
   return messages.length ? messages : [{ role: 'user', content: '' }]
 }
 

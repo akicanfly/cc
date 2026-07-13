@@ -1598,6 +1598,22 @@ async function* queryModel(
       }
     }
 
+    // Forward the user's effort choice into output_config.effort when the
+    // OpenAI-compatible provider is active. The OAI shim (openaiCompatible.ts)
+    // reads output_config.effort and translates it to reasoning_effort via
+    // the variant-blob table. For the first-party Anthropic path, effort
+    // already flows through lowerThinking's thinking param at line 1623, and
+    // the SDK already sends output_config.effort to the API when present
+    // (BetaOutputConfig is part of the schema). Gating on the env var keeps
+    // the first-party request shape unchanged.
+    if (
+      typeof effort === 'string' &&
+      !('effort' in outputConfig) &&
+      (process.env.OPENAI_COMPATIBLE_BASE_URL || process.env.OPENAI_BASE_URL)
+    ) {
+      outputConfig.effort = effort as BetaOutputConfig['effort']
+    }
+
     // Retry context gets preference because it tries to course correct if we exceed the context window limit
     const maxOutputTokens =
       retryContext?.maxTokensOverride ||
