@@ -23,7 +23,7 @@ import {
   statSync,
   unlinkSync,
 } from 'node:fs'
-import { join, resolve, dirname, basename, isAbsolute } from 'node:path'
+import { join, resolve, dirname, isAbsolute } from 'node:path'
 import { spawn } from 'node:child_process'
 
 // ---- CLI parsing -----------------------------------------------------------
@@ -113,7 +113,7 @@ function validateSource(path: string): { ok: true; size: number } | { ok: false;
   return { ok: true, size }
 }
 
-const sourceName = basename(absoluteSource)
+const sourceName = defaultName
 
 if (uninstall) {
   // In uninstall mode the source is informational; we still want to refuse if

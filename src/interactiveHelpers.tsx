@@ -7,7 +7,6 @@ import { type ChannelEntry, getAllowedChannels, setAllowedChannels, setHasDevCha
 import type { Command } from './commands.js';
 import { createStatsStore, type StatsStore } from './context/stats.js';
 import { getSystemContext } from './context.js';
-import { initializeTelemetryAfterTrust } from './entrypoints/init.js';
 import { isSynchronizedOutputSupported } from './ink/terminal.js';
 import type { RenderOptions, Root, TextProps } from './ink.js';
 import { KeybindingSetup } from './keybindings/KeybindingProviderSetup.js';
@@ -187,7 +186,6 @@ export async function showSetupScreens(root: Root, permissionMode: PermissionMod
   // otelHeadersHelper (which requires trust to execute) are available.
   // Defer to next tick so the OTel dynamic import resolves after first render
   // instead of during the pre-render microtask queue.
-  setImmediate(() => initializeTelemetryAfterTrust());
   if (await isQualifiedForGrove()) {
     const {
       GroveDialog

@@ -50,8 +50,8 @@ export class SandboxManager {
     violationStore.clear();
   }
 
-  static async wrapWithSandbox(command) {
-    return command;
+  static async wrapWithSandbox() {
+    throw new Error("Sandbox runtime is unavailable in this build");
   }
 
   static getFsReadConfig() {

@@ -1,11 +1,9 @@
 import { readFileSync } from 'fs'
-import { mkdir, writeFile } from 'fs/promises'
+import { mkdir, rename, writeFile } from 'fs/promises'
 import envPaths from 'env-paths'
 import { join } from 'path'
 import { z } from 'zod/v4'
 import { logForDebugging } from '../debug.js'
-import { getClaudeConfigHomeDir } from '../envUtils.js'
-import { safeParseJSON } from '../json.js'
 import { lazySchema } from '../lazySchema.js'
 import { isEssentialTrafficOnly } from '../privacyLevel.js'
 import { jsonStringify } from '../slowOperations.js'
@@ -111,7 +109,7 @@ function getCacheDir(): string {
   // envPaths('claude-cli') honours XDG_CACHE_HOME on Linux, ~/Library/Caches
   // on macOS, %LOCALAPPDATA% on Windows. The project-local cachePaths.ts uses
   // the same helper but appends a per-cwd hash; we deliberately don't.
-  return join(envPaths('claude-cli').cache, getClaudeConfigHomeDir())
+  return envPaths('cc').cache
 }
 
 function getCachePath(): string {
@@ -126,7 +124,8 @@ function normalizeModelId(id: string): string {
   return id
     .trim()
     .toLowerCase()
-    .replace(/\[[^\]]*\]/g, '')
+    .replace(/[-\s]*\[[^\]]*\]$/g, '')
+    .replace(/(?:-|:)free$/i, '')
     .replace(/:[a-z0-9_-]+$/i, '')
     .replace(/\s+/g, ' ')
     .trim()
@@ -199,7 +198,7 @@ function readCacheSync(path: string): { entries: ModelDevEntry[]; timestamp: num
   try {
     // eslint-disable-next-line custom-rules/no-sync-fs -- called from sync lookup; same pattern as modelCapabilities
     const raw = readFileSync(path, 'utf-8')
-    const parsed = CacheFileSchema().safeParse(safeParseJSON(raw, false))
+    const parsed = CatalogFileSchema().safeParse(JSON.parse(raw) as unknown)
     return parsed.success ? parsed.data : null
   } catch {
     return null
@@ -210,16 +209,51 @@ function readCacheSync(path: string): { entries: ModelDevEntry[]; timestamp: num
 // read by getModelDevEntry. We hold the parsed entries in memory so the
 // request path never touches the filesystem. Sorted longest-normalized-first
 // so the substring scan exits early on common matches.
-let inMemory: { entries: ModelDevEntry[]; byNormalized: Map<string, ModelDevEntry> } | undefined
+let inMemory: {
+  entries: ModelDevEntry[]
+  byNormalized: Map<string, ModelDevEntry>
+  timestamp: number
+} | undefined
 
-function rebuildIndex(entries: ModelDevEntry[]): { entries: ModelDevEntry[]; byNormalized: Map<string, ModelDevEntry> } {
-  const sorted = [...entries].sort((a, b) => b.normalized.length - a.normalized.length)
-  const byNormalized = new Map<string, ModelDevEntry>()
-  for (const e of sorted) {
-    // If two providers share an id (rare but possible), keep the first seen.
-    if (!byNormalized.has(e.normalized)) byNormalized.set(e.normalized, e)
+function rebuildIndex(
+  entries: ModelDevEntry[],
+  timestamp: number,
+): {
+  entries: ModelDevEntry[]
+  byNormalized: Map<string, ModelDevEntry>
+  timestamp: number
+} {
+  const grouped = new Map<string, ModelDevEntry[]>()
+  for (const entry of entries) {
+    const group = grouped.get(entry.normalized)
+    if (group) group.push(entry)
+    else grouped.set(entry.normalized, [entry])
   }
-  return { entries: sorted, byNormalized }
+  const byNormalized = new Map<string, ModelDevEntry>()
+  for (const [normalized, group] of grouped) {
+    const first = group[0]!
+    if (group.every(entry => hasEquivalentMetadata(first, entry))) {
+      byNormalized.set(normalized, first)
+    }
+  }
+  const sorted = [...byNormalized.values()].sort(
+    (a, b) => b.normalized.length - a.normalized.length,
+  )
+  return { entries: sorted, byNormalized, timestamp }
+}
+
+function hasEquivalentMetadata(
+  left: ModelDevEntry,
+  right: ModelDevEntry,
+): boolean {
+  return (
+    left.contextWindow === right.contextWindow &&
+    left.maxOutput === right.maxOutput &&
+    left.supportsImage === right.supportsImage &&
+    left.supportsToolCall === right.supportsToolCall &&
+    left.isReasoning === right.isReasoning &&
+    left.reasoningOptions.join('\0') === right.reasoningOptions.join('\0')
+  )
 }
 
 function loadFromDisk(): { entries: ModelDevEntry[]; timestamp: number } | null {
@@ -235,7 +269,7 @@ async function fetchAndCache(): Promise<void> {
     const response = await fetch(MODELS_DEV_URL, {
       signal: controller.signal,
       headers: {
-        'User-Agent': 'claude-code/modelsdev-catalog',
+        'User-Agent': 'cc/modelsdev-catalog',
         Accept: 'application/json',
       },
     })
@@ -252,12 +286,16 @@ async function fetchAndCache(): Promise<void> {
 
     const dir = getCacheDir()
     await mkdir(dir, { recursive: true })
-    const payload = { entries, timestamp: Date.now() }
-    await writeFile(getCachePath(), jsonStringify(payload), {
+    const timestamp = Date.now()
+    const payload = { entries, timestamp }
+    const cachePath = getCachePath()
+    const temporaryPath = `${cachePath}.${process.pid}.${timestamp}.tmp`
+    await writeFile(temporaryPath, jsonStringify(payload), {
       encoding: 'utf-8',
       mode: 0o600,
     })
-    inMemory = rebuildIndex(entries)
+    await rename(temporaryPath, cachePath)
+    inMemory = rebuildIndex(entries, timestamp)
     logForDebugging(`[modelsDevCatalog] cached ${entries.length} models from ${MODELS_DEV_URL}`)
   } catch (error) {
     logForDebugging(
@@ -276,9 +314,14 @@ async function fetchAndCache(): Promise<void> {
  */
 export function refreshModelsDevCatalog(): Promise<void> {
   if (isEssentialTrafficOnly()) return Promise.resolve()
+  if (!inMemory) {
+    const cached = loadFromDisk()
+    if (cached) inMemory = rebuildIndex(cached.entries, cached.timestamp)
+  }
+  if (inMemory && Date.now() - inMemory.timestamp < CACHE_TTL_MS) {
+    return Promise.resolve()
+  }
   refreshPromise ??= fetchAndCache().finally(() => {
-    // Allow a future refresh after a long-lived process (e.g. 24h later).
-    // We don't add a timer here — callers can re-invoke after the TTL.
     refreshPromise = undefined
   })
   return refreshPromise
@@ -299,7 +342,7 @@ export function refreshModelsDevCatalog(): Promise<void> {
 export function getModelDevEntry(model: string): ModelDevEntry | undefined {
   if (!inMemory) {
     const fromDisk = loadFromDisk()
-    if (fromDisk) inMemory = rebuildIndex(fromDisk.entries)
+    if (fromDisk) inMemory = rebuildIndex(fromDisk.entries, fromDisk.timestamp)
   }
   if (!inMemory) return undefined
 
@@ -319,26 +362,4 @@ export function getModelDevEntry(model: string): ModelDevEntry | undefined {
     if (normalized.includes(entry.normalized)) return entry
   }
   return undefined
-}
-
-/**
- * Test/diagnostic helper. Forces a refresh and waits for it. Not used in
- * production paths.
- */
-export async function _forceRefreshModelsDevCatalog(): Promise<void> {
-  refreshPromise = undefined
-  await fetchAndCache()
-}
-
-/**
- * Read-only accessor for the in-memory index. Returns an empty array if
- * the cache hasn't been loaded yet. Used by the model picker to enrich
- * labels for the full model list at startup.
- */
-export function listAllModelDevEntries(): ModelDevEntry[] {
-  if (!inMemory) {
-    const fromDisk = loadFromDisk()
-    if (fromDisk) inMemory = rebuildIndex(fromDisk.entries)
-  }
-  return inMemory?.entries ?? []
 }

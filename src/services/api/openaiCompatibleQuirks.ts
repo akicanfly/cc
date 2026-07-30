@@ -16,12 +16,25 @@ export function shouldSendOpenAISamplingParams(model: string, env: EnvLike = pro
   const override = parseBooleanEnv(env.OPENAI_COMPATIBLE_SAMPLING_PARAMS)
   if (override !== undefined) return override
 
-  const normalized = model.trim().toLowerCase()
+  const normalized = normalizeModelName(model)
   return !isOpenAIReasoningOnlyModel(normalized)
+}
+
+export function shouldUseMaxCompletionTokens(
+  model: string,
+  env: EnvLike = process.env,
+): boolean {
+  const override = parseBooleanEnv(env.OPENAI_COMPATIBLE_MAX_COMPLETION_TOKENS)
+  if (override !== undefined) return override
+  return isOpenAIReasoningOnlyModel(normalizeModelName(model))
 }
 
 function isOpenAIReasoningOnlyModel(model: string): boolean {
   return /^o\d(?:[-.]|$)/.test(model) || /^gpt-5(?:[-.]|$)/.test(model)
+}
+
+function normalizeModelName(model: string): string {
+  return model.trim().toLowerCase().split('/').at(-1) ?? ''
 }
 
 function openAICompatibleHost(baseURL: string): string {

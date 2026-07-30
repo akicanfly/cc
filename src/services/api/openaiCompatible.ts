@@ -1,4 +1,10 @@
 import type { ClientOptions } from '@anthropic-ai/sdk'
+import {
+  APIConnectionError,
+  APIConnectionTimeoutError,
+  APIError,
+  APIUserAbortError,
+} from '@anthropic-ai/sdk/error'
 import type { BetaMessageStreamParams } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
 import { randomUUID } from 'crypto'
 import { lowerThinking } from './effort/lowerThinking.js'
@@ -11,12 +17,15 @@ import {
 import {
   shouldSendOpenAISamplingParams,
   shouldSendOpenAIStreamOptions,
+  shouldUseMaxCompletionTokens,
 } from './openaiCompatibleQuirks.js'
 import { getVariantBlob } from 'src/utils/effort/modelVariants.js'
 import type { VariantBlob } from 'src/utils/effort/variantTypes.js'
 import { isVariantID } from 'src/utils/effort/variantTypes.js'
-import { getModelDevEntry } from 'src/utils/model/modelsDevCatalog.js'
-import { logForDebugging } from 'src/utils/debug.js'
+import {
+  type OpenAICompatibleConfig,
+  requireOpenAICompatibleConfig,
+} from 'src/utils/openAICompatibleConfig.js'
 
 type AnthropicStreamEvent = {
   type: string
@@ -67,10 +76,15 @@ type OpenAIChatRequest = {
   tools?: OpenAIChatTool[]
   tool_choice?: OpenAIToolChoice
   max_tokens?: number
+  max_completion_tokens?: number
   temperature?: number
   top_p?: number
   stop?: string[]
   reasoning_effort?: string
+  response_format?: {
+    type: 'json_schema'
+    json_schema: { name: string; strict: boolean; schema: unknown }
+  }
 }
 
 type OpenAIChatCompletion = {
@@ -122,16 +136,7 @@ type OpenAIToolCallDelta = {
 type OpenAIUsage = {
   prompt_tokens?: number
   completion_tokens?: number
-  total_tokens?: number
   prompt_tokens_details?: { cached_tokens?: number } | null
-  completion_tokens_details?: { reasoning_tokens?: number } | null
-}
-
-type OpenAICompatibleConfig = {
-  baseURL: string
-  apiKey: string
-  headers: Record<string, string>
-  timeoutMs: number
 }
 
 type ToolAccumulator = {
@@ -139,26 +144,36 @@ type ToolAccumulator = {
   id?: string
   name?: string
   arguments: string
-  started: boolean
-}
-
-export function isOpenAICompatibleEnabled(): boolean {
-  return !!getOpenAICompatibleConfig()
 }
 
 export async function listOpenAICompatibleModels(): Promise<string[]> {
   const config = requireOpenAICompatibleConfig()
-  const response = await globalThis.fetch(
-    `${config.baseURL.replace(/\/+$/, '')}/models`,
-    {
+  const timeout = timeoutSignal(config.timeoutMs)
+  let response: Response
+  try {
+    response = await globalThis.fetch(`${config.baseURL}/models`, {
       method: 'GET',
+      signal: timeout,
       headers: {
         ...config.headers,
-        Authorization: `Bearer ${config.apiKey}`,
+        ...(config.apiKey
+          ? { Authorization: `Bearer ${config.apiKey}` }
+          : {}),
         'Content-Type': 'application/json',
       },
-    },
-  )
+    })
+  } catch (error) {
+    if (timeout.aborted) {
+      throw new APIConnectionTimeoutError({
+        message: 'OpenAI-compatible models request timed out',
+        cause: error instanceof Error ? error : undefined,
+      })
+    }
+    throw new APIConnectionError({
+      message: 'OpenAI-compatible models request failed',
+      cause: error instanceof Error ? error : undefined,
+    })
+  }
 
   if (!response.ok) {
     throw await createOpenAICompatibleResponseError(response, 'models request')
@@ -178,13 +193,26 @@ export function createOpenAICompatibleAnthropicClient({
   return {
     beta: {
       messages: {
-        create(params: BetaMessageStreamParams, options?: { signal?: AbortSignal }) {
+        create(
+          params: BetaMessageStreamParams,
+          options?: { signal?: AbortSignal; timeout?: number },
+        ) {
           if (!params.stream) {
-            return createOpenAICompatibleMessage(params, options?.signal, fetchOverride)
+            return createOpenAICompatibleMessage(
+              params,
+              options?.signal,
+              options?.timeout,
+              fetchOverride,
+            )
           }
           return {
             withResponse: () =>
-              createOpenAICompatibleStream(params, options?.signal, fetchOverride),
+              createOpenAICompatibleStream(
+                params,
+                options?.signal,
+                options?.timeout,
+                fetchOverride,
+              ),
           }
         },
       },
@@ -195,6 +223,7 @@ export function createOpenAICompatibleAnthropicClient({
 async function createOpenAICompatibleMessage(
   params: BetaMessageStreamParams,
   signal: AbortSignal | undefined,
+  timeoutMs: number | undefined,
   fetchOverride: ClientOptions['fetch'] | undefined,
 ): Promise<Record<string, unknown>> {
   const config = requireOpenAICompatibleConfig()
@@ -203,12 +232,16 @@ async function createOpenAICompatibleMessage(
     params,
     stream: false,
     signal,
+    timeoutMs,
     fetchOverride,
   })
 
   const parsed = (await response.json()) as OpenAIChatCompletion
   const message = parsed.choices?.[0]?.message
-  const textualToolCall = parseTextualToolCall(message?.content)
+  if (!message) {
+    throw new Error('OpenAI-compatible response did not contain choices[0].message')
+  }
+  const textualToolCall = parseTextualToolCall(message.content, params)
   const content: Array<Record<string, unknown>> = []
 
   if (textualToolCall && !message?.tool_calls?.length) {
@@ -221,10 +254,15 @@ async function createOpenAICompatibleMessage(
   } else {
     if (message?.content) content.push({ type: 'text', text: message.content })
     for (const toolCall of message?.tool_calls ?? []) {
+      const name = toolCall.function?.name
+      if (!name) {
+        throw new Error('OpenAI-compatible tool call did not include a name')
+      }
+      validateToolName(name, params)
       content.push({
         type: 'tool_use',
         id: toolCall.id ?? `toolu_${randomUUID()}`,
-        name: toolCall.function?.name ?? 'tool',
+        name,
         input: parseToolInput(toolCall.function?.arguments),
       })
     }
@@ -249,6 +287,7 @@ async function createOpenAICompatibleMessage(
 async function createOpenAICompatibleStream(
   params: BetaMessageStreamParams,
   signal: AbortSignal | undefined,
+  timeoutMs: number | undefined,
   fetchOverride: ClientOptions['fetch'] | undefined,
 ): Promise<{
   data: AsyncIterable<AnthropicStreamEvent> & { controller: AbortController }
@@ -262,6 +301,7 @@ async function createOpenAICompatibleStream(
     params,
     stream: true,
     signal: controller.signal,
+    timeoutMs,
     fetchOverride,
   })
 
@@ -271,7 +311,7 @@ async function createOpenAICompatibleStream(
 
   const requestId = response.headers.get('x-request-id')
   return {
-    data: fromOpenAIStream(response.body, params.model, controller),
+    data: fromOpenAIStream(response.body, params, controller),
     response,
     request_id: requestId,
   }
@@ -282,28 +322,30 @@ async function postOpenAIChatCompletion({
   params,
   stream,
   signal,
+  timeoutMs,
   fetchOverride,
 }: {
   config: OpenAICompatibleConfig
   params: BetaMessageStreamParams
   stream: boolean
   signal: AbortSignal | undefined
+  timeoutMs: number | undefined
   fetchOverride: ClientOptions['fetch'] | undefined
 }): Promise<Response> {
-  const timeout = timeoutSignal(config.timeoutMs)
-  const controller = linkedAbortController(signal)
-  const abortTimeout = () => controller.abort(timeout.reason)
-  timeout.addEventListener('abort', abortTimeout, { once: true })
+  const timeout = timeoutSignal(timeoutMs ?? config.timeoutMs)
+  const requestSignal = combineAbortSignals(signal, timeout)
 
   try {
     const response = await (fetchOverride ?? globalThis.fetch)(
       `${config.baseURL.replace(/\/+$/, '')}/chat/completions`,
       {
         method: 'POST',
-        signal: controller.signal,
+          signal: requestSignal,
         headers: {
           ...config.headers,
-          Authorization: `Bearer ${config.apiKey}`,
+          ...(config.apiKey
+            ? { Authorization: `Bearer ${config.apiKey}` }
+            : {}),
           'Content-Type': 'application/json',
         },
         body: JSON.stringify(toOpenAIRequest(params, stream, config)),
@@ -314,48 +356,19 @@ async function postOpenAIChatCompletion({
       throw await createOpenAICompatibleResponseError(response, 'chat completion request')
     }
     return response
-  } finally {
-    timeout.removeEventListener('abort', abortTimeout)
-  }
-}
-
-function getOpenAICompatibleConfig(): OpenAICompatibleConfig | undefined {
-  const baseURL = (process.env.OPENAI_COMPATIBLE_BASE_URL || process.env.OPENAI_BASE_URL)?.trim()
-  const apiKey = process.env.OPENAI_COMPATIBLE_API_KEY || process.env.OPENAI_API_KEY
-  if (!baseURL || !apiKey) return undefined
-
-  try {
-    new URL(baseURL)
-  } catch {
-    throw new Error('OpenAI-compatible provider requires a valid OPENAI_COMPATIBLE_BASE_URL or OPENAI_BASE_URL')
-  }
-
-  return {
-    baseURL,
-    apiKey,
-    headers: parseHeaders(process.env.OPENAI_COMPATIBLE_HEADERS),
-    timeoutMs: parseInt(process.env.OPENAI_COMPATIBLE_TIMEOUT_MS || process.env.API_TIMEOUT_MS || String(600_000), 10),
-  }
-}
-
-function requireOpenAICompatibleConfig(): OpenAICompatibleConfig {
-  const config = getOpenAICompatibleConfig()
-  if (!config) {
-    throw new Error('OpenAI-compatible provider requires OPENAI_COMPATIBLE_BASE_URL or OPENAI_BASE_URL and an API key')
-  }
-  return config
-}
-
-function parseHeaders(raw: string | undefined): Record<string, string> {
-  if (!raw) return {}
-  try {
-    const parsed = JSON.parse(raw) as unknown
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
-    return Object.fromEntries(
-      Object.entries(parsed).filter((entry): entry is [string, string] => typeof entry[1] === 'string'),
-    )
-  } catch {
-    throw new Error('OPENAI_COMPATIBLE_HEADERS must be valid JSON object with string values')
+  } catch (error) {
+    if (signal?.aborted) throw new APIUserAbortError()
+    if (timeout.aborted) {
+      throw new APIConnectionTimeoutError({
+        message: 'OpenAI-compatible request timed out',
+        cause: error instanceof Error ? error : undefined,
+      })
+    }
+    if (error instanceof APIError) throw error
+    throw new APIConnectionError({
+      message: 'OpenAI-compatible request failed',
+      cause: error instanceof Error ? error : undefined,
+    })
   }
 }
 
@@ -377,44 +390,13 @@ function toOpenAIRequest(
   )
   const sendSamplingParams = shouldSendOpenAISamplingParams(params.model)
 
-  // models.dev enrichment: look up the model's capabilities once per request.
-  // Tri-state booleans: true = use as-is, false = explicitly opt out,
-  // null = unknown, fall through to current behavior. Catalog lookups are
-  // sync (in-memory index) so adding this is free.
-  const dev = getModelDevEntry(params.model)
-  const supportsToolCall = dev?.supportsToolCall
-  const isReasoningModel = dev?.isReasoning === true
-  const reasoningOptions = dev?.reasoningOptions ?? []
-
-  // (a) Default max_tokens: only set when the caller didn't, and only when
-  // the catalog has a real number. Prefer limit.output (the model's actual
-  // output cap); fall back to limit.context minus a small reservation.
-  // 0 / null / undefined -> leave params.max_tokens alone.
-  const maxTokens =
-    params.max_tokens !== undefined
-      ? params.max_tokens
-      : pickDefaultMaxTokens(dev?.maxOutput, dev?.contextWindow)
-
-  // (b) Tool gating: when the catalog explicitly says tool_call=false, omit
-  // the tools field entirely so we don't ship a request the server will
-  // reject. When supportsToolCall is null/true, keep current behavior.
-  const tools =
-    supportsToolCall === false
-      ? undefined
-      : params.tools?.length
-        ? params.tools.map(toOpenAITool)
-        : undefined
-
-  // (c) Reasoning default: for known reasoning models without an explicit
-  // reasoning_effort, pick the first catalog option or 'medium'. The
-  // variantBlob path (output_config.effort -> reasoning_effort) takes
-  // precedence; the catalog path only fills in when that's absent.
+  const tools = params.tools?.length
+    ? params.tools.map(toOpenAITool)
+    : undefined
   const variantReasoningEffort = extractReasoningEffortFromVariant(variantBlob)
-  const reasoningEffort =
-    variantReasoningEffort
-      ?? (isReasoningModel
-        ? (reasoningOptions[0] ?? 'medium')
-        : undefined)
+  const tokenLimit = params.max_tokens
+  const useCompletionTokens = shouldUseMaxCompletionTokens(params.model)
+  const responseFormat = toOpenAIResponseFormat(params.output_config?.format)
 
   return {
     model: params.model,
@@ -422,31 +404,32 @@ function toOpenAIRequest(
     ...(stream && shouldSendOpenAIStreamOptions(config.baseURL) ? { stream_options: { include_usage: true } } : {}),
     messages: [
       ...systemMessages(params.system),
-      ...params.messages.flatMap(message => toOpenAIMessages(message, dev?.supportsImage === false, params.model)),
+      ...params.messages.flatMap(message => toOpenAIMessages(message)),
     ],
     ...(tools ? { tools } : {}),
     ...(toolChoice ? { tool_choice: toolChoice } : {}),
-    ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
+    ...(tokenLimit !== undefined && useCompletionTokens
+      ? { max_completion_tokens: tokenLimit }
+      : tokenLimit !== undefined
+        ? { max_tokens: tokenLimit }
+        : {}),
     ...(sendSamplingParams && params.temperature !== undefined ? { temperature: params.temperature } : {}),
     ...(sendSamplingParams && params.top_p !== undefined ? { top_p: params.top_p } : {}),
     ...(params.stop_sequences?.length ? { stop: params.stop_sequences } : {}),
-    ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+    ...(variantReasoningEffort ? { reasoning_effort: variantReasoningEffort } : {}),
+    ...(responseFormat ? { response_format: responseFormat } : {}),
     ...loweredThinking.extraBodyParams,
   }
 }
 
-function pickDefaultMaxTokens(
-  maxOutput: number | null | undefined,
-  contextWindow: number | null | undefined,
-): number | undefined {
-  // Prefer the model's documented output cap. If only context is known,
-  // reserve a generous input share but never exceed 64k (matches
-  // CAPPED_DEFAULT_MAX_TOKENS guardrails in claude.ts).
-  if (typeof maxOutput === 'number' && maxOutput > 0) return maxOutput
-  if (typeof contextWindow === 'number' && contextWindow > 0) {
-    return Math.min(64_000, Math.max(1, Math.floor(contextWindow / 2)))
+function toOpenAIResponseFormat(format: unknown): OpenAIChatRequest['response_format'] | undefined {
+  if (!format || typeof format !== 'object') return undefined
+  const value = format as { type?: unknown; schema?: unknown }
+  if (value.type !== 'json_schema' || !value.schema) return undefined
+  return {
+    type: 'json_schema',
+    json_schema: { name: 'response', strict: true, schema: value.schema },
   }
-  return undefined
 }
 
 function extractReasoningEffortFromVariant(
@@ -486,14 +469,12 @@ function systemMessages(system: BetaMessageStreamParams['system']): OpenAIMessag
 
 function toOpenAIMessages(
   message: BetaMessageStreamParams['messages'][number],
-  dropImages: boolean,
-  model: string,
 ): OpenAIMessage[] {
   if (typeof message.content === 'string') return [{ role: message.role, content: message.content }]
 
   const content = message.content as Array<{ type: string } & Record<string, unknown>>
   if (message.role === 'assistant') return toOpenAIAssistantMessages(content)
-  return toOpenAIUserMessages(content, dropImages, model)
+  return toOpenAIUserMessages(content)
 }
 
 function toOpenAIAssistantMessages(content: Array<{ type: string } & Record<string, unknown>>): OpenAIMessage[] {
@@ -538,12 +519,9 @@ function toOpenAIAssistantMessages(content: Array<{ type: string } & Record<stri
 
 function toOpenAIUserMessages(
   content: Array<{ type: string } & Record<string, unknown>>,
-  dropImages: boolean,
-  model: string,
 ): OpenAIMessage[] {
   const messages: OpenAIMessage[] = []
   let contentParts: OpenAIUserContentPart[] = []
-  let droppedImages = 0
 
   const flushContent = () => {
     if (!contentParts.length) return
@@ -561,15 +539,12 @@ function toOpenAIUserMessages(
       continue
     }
     if (block.type === 'image') {
-      // Catalog-driven vision gate: when models.dev explicitly says
-      // supportsImage=false, drop the image rather than letting the server
-      // reject the request. We don't drop on a null (unknown) — that's the
-      // safe default that preserves current behavior.
-      if (dropImages) {
-        droppedImages += 1
-        continue
-      }
-      const source = block.source as { media_type?: unknown; data?: unknown } | undefined
+      const source = block.source as {
+        type?: unknown
+        media_type?: unknown
+        data?: unknown
+        url?: unknown
+      } | undefined
       const mediaType = asString(source?.media_type)
       const data = asString(source?.data)
       if (mediaType && data) {
@@ -577,6 +552,13 @@ function toOpenAIUserMessages(
           type: 'image_url',
           image_url: { url: `data:${mediaType};base64,${data}` },
         })
+      } else if (asString(source?.url)) {
+        contentParts.push({
+          type: 'image_url',
+          image_url: { url: asString(source?.url)! },
+        })
+      } else {
+        throw new Error('OpenAI-compatible image block has an unsupported source')
       }
       continue
     }
@@ -591,17 +573,12 @@ function toOpenAIUserMessages(
   }
 
   flushContent()
-  if (droppedImages > 0) {
-    logForDebugging(
-      `[openaiCompatible] dropped ${droppedImages} image block(s) for non-vision model ${model}`,
-    )
-  }
   return messages.length ? messages : [{ role: 'user', content: '' }]
 }
 
 function fromOpenAIStream(
   body: ReadableStream<Uint8Array>,
-  model: string,
+  params: BetaMessageStreamParams,
   controller: AbortController,
 ): AsyncIterable<AnthropicStreamEvent> & { controller: AbortController } {
   const stream = (async function* () {
@@ -612,7 +589,7 @@ function fromOpenAIStream(
         id: messageId,
         type: 'message',
         role: 'assistant',
-        model,
+        model: params.model,
         content: [],
         stop_reason: null,
         stop_sequence: null,
@@ -627,6 +604,8 @@ function fromOpenAIStream(
     let textualToolCandidate = ''
     let stopReason: string | null = null
     let usage = toAnthropicUsage()
+    let sawChoice = false
+    let sawFinishReason = false
     const tools = new Map<number, ToolAccumulator>()
 
     for await (const frame of readSSE(body)) {
@@ -636,12 +615,21 @@ function fromOpenAIStream(
         }
         if (parsed.usage) usage = toAnthropicUsage(parsed.usage)
         const choice = parsed.choices?.[0]
-        if (choice?.finish_reason) stopReason = mapStopReason(choice.finish_reason)
+        if (choice) sawChoice = true
+        if (choice?.finish_reason) {
+          sawFinishReason = true
+          stopReason = mapStopReason(choice.finish_reason)
+        }
         const delta = choice?.delta ?? choice?.message
         if (!delta) continue
 
         const reasoning = reasoningDeltaText(delta)
         if (reasoning) {
+          if (tools.size > 0) {
+            throw new Error(
+              'OpenAI-compatible stream emitted reasoning after tool calls',
+            )
+          }
           const previousIndex = reasoningBlockIndex
           reasoningBlockIndex = yield* yieldReasoningDelta(
             reasoning,
@@ -654,6 +642,11 @@ function fromOpenAIStream(
 
         const text = textDeltaText(delta)
         if (text) {
+          if (tools.size > 0) {
+            throw new Error(
+              'OpenAI-compatible stream emitted text after tool calls',
+            )
+          }
           if (reasoningBlockOpen && reasoningBlockIndex !== undefined) {
             yield { type: 'content_block_stop', index: reasoningBlockIndex }
             reasoningBlockOpen = false
@@ -680,14 +673,23 @@ function fromOpenAIStream(
             reasoningBlockOpen = false
             reasoningBlockIndex = undefined
           }
+          if (textBlockIndex !== undefined) {
+            yield { type: 'content_block_stop', index: textBlockIndex }
+            textBlockIndex = undefined
+          }
           const events = appendToolDelta(tools, toolDelta, nextBlockIndex)
-          if (events.started) nextBlockIndex += 1
-          for (const event of events.events) yield event
+          if (events.created) nextBlockIndex += 1
         }
       }
     }
 
-    const textualToolCall = tools.size === 0 ? parseTextualToolCall(textualToolCandidate) : null
+    if (!sawChoice || !sawFinishReason) {
+      throw new Error('OpenAI-compatible stream ended before a finish reason was received')
+    }
+
+    const textualToolCall = tools.size === 0
+      ? parseTextualToolCall(textualToolCandidate, params)
+      : null
     if (textualToolCall) {
       yield {
         type: 'content_block_start',
@@ -709,8 +711,33 @@ function fromOpenAIStream(
 
     if (reasoningBlockOpen && reasoningBlockIndex !== undefined) yield { type: 'content_block_stop', index: reasoningBlockIndex }
     if (textBlockIndex !== undefined) yield { type: 'content_block_stop', index: textBlockIndex }
-    for (const tool of tools.values()) {
-      if (tool.started) yield { type: 'content_block_stop', index: tool.blockIndex }
+    for (const tool of [...tools.values()].sort(
+      (a, b) => a.blockIndex - b.blockIndex,
+    )) {
+      if (!tool.name) {
+        throw new Error('OpenAI-compatible tool call did not include a name')
+      }
+      validateToolName(tool.name, params)
+      parseToolInput(tool.arguments)
+      yield {
+        type: 'content_block_start',
+        index: tool.blockIndex,
+        content_block: {
+          type: 'tool_use',
+          id: tool.id ?? `toolu_${randomUUID()}`,
+          name: tool.name,
+          input: {},
+        },
+      }
+      yield {
+        type: 'content_block_delta',
+        index: tool.blockIndex,
+        delta: {
+          type: 'input_json_delta',
+          partial_json: tool.arguments || '{}',
+        },
+      }
+      yield { type: 'content_block_stop', index: tool.blockIndex }
     }
     yield {
       type: 'message_delta',
@@ -753,47 +780,21 @@ function appendToolDelta(
   tools: Map<number, ToolAccumulator>,
   delta: OpenAIToolCallDelta,
   nextBlockIndex: number,
-): { started: boolean; events: AnthropicStreamEvent[] } {
+): { created: boolean } {
   const openAIIndex = delta.index ?? 0
   let tool = tools.get(openAIIndex)
-  let started = false
+  let created = false
   if (!tool) {
-    tool = { blockIndex: nextBlockIndex, arguments: '', started: false }
+    tool = { blockIndex: nextBlockIndex, arguments: '' }
     tools.set(openAIIndex, tool)
+    created = true
   }
   if (delta.id) tool.id = delta.id
   if (delta.function?.name) tool.name = delta.function.name
 
   const args = delta.function?.arguments
-  const previousArguments = tool.arguments
   if (args) tool.arguments += args
-
-  const events: AnthropicStreamEvent[] = []
-  if (!tool.started && tool.name) {
-    tool.started = true
-    started = true
-    events.push({
-      type: 'content_block_start',
-      index: tool.blockIndex,
-      content_block: { type: 'tool_use', id: tool.id ?? `toolu_${randomUUID()}`, name: tool.name, input: {} },
-    })
-    if (previousArguments) {
-      events.push({
-        type: 'content_block_delta',
-        index: tool.blockIndex,
-        delta: { type: 'input_json_delta', partial_json: previousArguments },
-      })
-    }
-  }
-
-  if (args && tool.started) {
-    events.push({
-      type: 'content_block_delta',
-      index: tool.blockIndex,
-      delta: { type: 'input_json_delta', partial_json: args },
-    })
-  }
-  return { started, events }
+  return { created }
 }
 
 async function* readSSE(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
@@ -909,12 +910,23 @@ function mapStopReason(reason: string | null | undefined): string {
 }
 
 function toAnthropicUsage(usage?: OpenAIUsage | null) {
+  const promptTokens = finiteTokenCount(usage?.prompt_tokens)
+  const cachedTokens = Math.min(
+    promptTokens,
+    finiteTokenCount(usage?.prompt_tokens_details?.cached_tokens),
+  )
   return {
-    input_tokens: usage?.prompt_tokens ?? 0,
-    output_tokens: usage?.completion_tokens ?? 0,
-    cache_read_input_tokens: usage?.prompt_tokens_details?.cached_tokens ?? 0,
+    input_tokens: promptTokens - cachedTokens,
+    output_tokens: finiteTokenCount(usage?.completion_tokens),
+    cache_read_input_tokens: cachedTokens,
     cache_creation_input_tokens: 0,
   }
+}
+
+function finiteTokenCount(value: number | undefined): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : 0
 }
 
 function asString(value: unknown): string | undefined {
@@ -924,9 +936,13 @@ function asString(value: unknown): string | undefined {
 function parseToolInput(input: string | undefined): unknown {
   if (!input) return {}
   try {
-    return JSON.parse(input) as unknown
+    const parsed = JSON.parse(input) as unknown
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('OpenAI-compatible tool arguments must be a JSON object')
+    }
+    return parsed
   } catch {
-    return {}
+    throw new Error('OpenAI-compatible tool arguments were not valid JSON')
   }
 }
 
@@ -958,14 +974,49 @@ function isPotentialTextualToolCall(text: string): boolean {
   return 'Tool call'.startsWith(trimmed) || trimmed.startsWith('Tool call')
 }
 
-function parseTextualToolCall(text: string | null | undefined): { name: string; input: unknown } | null {
+function parseTextualToolCall(
+  text: string | null | undefined,
+  params: BetaMessageStreamParams,
+): { name: string; input: unknown } | null {
   if (!text) return null
   const match = text.trim().match(/^Tool call\s+([A-Za-z0-9_-]+):\s*([\s\S]+)$/)
   if (!match) return null
   try {
-    return { name: match[1]!, input: JSON.parse(match[2]!.trim()) as unknown }
+    validateToolName(match[1]!, params)
   } catch {
     return null
+  }
+  try {
+    const input = JSON.parse(match[2]!.trim()) as unknown
+    if (!input || typeof input !== 'object' || Array.isArray(input)) return null
+    return { name: match[1]!, input }
+  } catch {
+    return null
+  }
+}
+
+function validateToolName(
+  name: string,
+  params: BetaMessageStreamParams,
+): void {
+  if (params.tool_choice?.type === 'none') {
+    throw new Error('OpenAI-compatible provider returned a tool call when tools were disabled')
+  }
+  const offeredTools = new Set(
+    (params.tools ?? []).flatMap(tool =>
+      'name' in tool && typeof tool.name === 'string' ? [tool.name] : [],
+    ),
+  )
+  if (!offeredTools.has(name)) {
+    throw new Error(`OpenAI-compatible provider returned unoffered tool ${name}`)
+  }
+  if (
+    params.tool_choice?.type === 'tool' &&
+    params.tool_choice.name !== name
+  ) {
+    throw new Error(
+      `OpenAI-compatible provider returned tool ${name} instead of required tool ${params.tool_choice.name}`,
+    )
   }
 }
 
@@ -984,3 +1035,18 @@ function timeoutSignal(timeoutMs: number): AbortSignal {
   return controller.signal
 }
 
+function combineAbortSignals(
+  signal: AbortSignal | undefined,
+  timeout: AbortSignal,
+): AbortSignal {
+  if (!signal) return timeout
+  if (typeof AbortSignal.any === 'function') return AbortSignal.any([signal, timeout])
+  const controller = linkedAbortController(signal)
+  if (timeout.aborted) controller.abort(timeout.reason)
+  else {
+    timeout.addEventListener('abort', () => controller.abort(timeout.reason), {
+      once: true,
+    })
+  }
+  return controller.signal
+}

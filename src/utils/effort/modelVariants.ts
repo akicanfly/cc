@@ -1,4 +1,5 @@
 import { getAPIProvider, type APIProvider } from '../model/providers.js'
+import { isOpenAICompatibleConfigured } from '../openAICompatibleConfig.js'
 import type { VariantBlob, VariantID, VariantTable } from './variantTypes.js'
 
 const OPENAI_REASONING_VARIANTS = [
@@ -71,7 +72,7 @@ export function getModelVariants(
 ): VariantTable {
   // Claude Code's OpenAI-compatible adapter routes arbitrary model IDs through
   // Chat Completions, whose native reasoning knob is `reasoning_effort`.
-  if (process.env.OPENAI_COMPATIBLE_BASE_URL || process.env.OPENAI_BASE_URL) {
+  if (isOpenAICompatibleConfigured()) {
     return openAICompatibleVariants()
   }
 

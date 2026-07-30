@@ -167,6 +167,7 @@ import { getMaxThinkingTokensForModel } from 'src/utils/context.js'
 import { getVariantBlob } from 'src/utils/effort/modelVariants.js'
 import type { VariantBlob, VariantID } from 'src/utils/effort/variantTypes.js'
 import { logForDebugging } from 'src/utils/debug.js'
+import { isOpenAICompatibleConfigured } from 'src/utils/openAICompatibleConfig.js'
 import { logForDiagnosticsNoPII } from 'src/utils/diagLogs.js'
 import { type EffortValue } from 'src/utils/effort.js'
 import {
@@ -1609,7 +1610,7 @@ async function* queryModel(
     if (
       typeof effort === 'string' &&
       !('effort' in outputConfig) &&
-      (process.env.OPENAI_COMPATIBLE_BASE_URL || process.env.OPENAI_BASE_URL)
+      isOpenAICompatibleConfigured()
     ) {
       outputConfig.effort = effort as BetaOutputConfig['effort']
     }

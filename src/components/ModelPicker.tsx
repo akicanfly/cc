@@ -30,7 +30,11 @@ import {
   modelDisplayString,
   parseUserSpecifiedModel,
 } from '../utils/model/model.js'
-import { type ModelOption, getModelOptions } from '../utils/model/modelOptions.js'
+import {
+  getDefaultOptionForUser,
+  type ModelOption,
+  getModelOptions,
+} from '../utils/model/modelOptions.js'
 import {
   getSettingsForSource,
   updateSettingsForSource,
@@ -93,7 +97,9 @@ export function ModelPicker({
   }, [useFetchedModels])
 
   const baseOptions = useMemo(() => {
-    if (useFetchedModels) return fetchedOptions ?? []
+    if (useFetchedModels) {
+      return [getDefaultOptionForUser(), ...(fetchedOptions ?? [])]
+    }
     return getModelOptions(isFastMode ?? false)
   }, [fetchedOptions, isFastMode, useFetchedModels])
 

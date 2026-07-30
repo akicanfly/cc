@@ -1,26 +1,10 @@
-import { OAUTH_BETA_HEADER } from '../../constants/oauth.js'
-import { getAnthropicClient } from '../../services/api/client.js'
-import {
-  isOpenAICompatibleEnabled,
-  listOpenAICompatibleModels,
-} from '../../services/api/openaiCompatible.js'
-import { isClaudeAISubscriber } from '../auth.js'
+import { listOpenAICompatibleModels } from '../../services/api/openaiCompatible.js'
 import { logForDebugging } from '../debug.js'
 import { isModelAllowed } from './modelAllowlist.js'
 import type { ModelOption } from './modelOptions.js'
 import { getModelDevEntry, refreshModelsDevCatalog } from './modelsDevCatalog.js'
 
 let fetchedModelOptionsPromise: Promise<ModelOption[]> | undefined
-
-async function listAnthropicModels(): Promise<string[]> {
-  const anthropic = await getAnthropicClient({ maxRetries: 1 })
-  const betas = isClaudeAISubscriber() ? [OAUTH_BETA_HEADER] : undefined
-  const ids: string[] = []
-  for await (const model of anthropic.models.list({ betas })) {
-    if (model.id) ids.push(model.id)
-  }
-  return ids
-}
 
 export function getFetchedModelOptions(): Promise<ModelOption[]> {
   fetchedModelOptionsPromise ??= fetchModelOptions()
@@ -29,18 +13,10 @@ export function getFetchedModelOptions(): Promise<ModelOption[]> {
 
 async function fetchModelOptions(): Promise<ModelOption[]> {
   try {
-    // Fire-and-forget: warm the models.dev catalog in the background so the
-    // first /models request can already use enrichment. Not awaited so the
-    // model picker is not blocked on a network round-trip. Failures are
-    // swallowed inside refreshModelsDevCatalog; on a cold cache with no
-    // network, the picker just shows id-only options.
-    if (isOpenAICompatibleEnabled()) {
-      void refreshModelsDevCatalog()
-    }
-
-    const ids = isOpenAICompatibleEnabled()
-      ? await listOpenAICompatibleModels()
-      : await listAnthropicModels()
+    const [ids] = await Promise.all([
+      listOpenAICompatibleModels(),
+      refreshModelsDevCatalog(),
+    ])
 
     const seen = new Set<string>()
     const options: ModelOption[] = []

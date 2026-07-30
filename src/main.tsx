@@ -29,7 +29,7 @@ import React from 'react';
 import { getOauthConfig } from './constants/oauth.js';
 import { getRemoteSessionUrl } from './constants/product.js';
 import { getSystemContext, getUserContext } from './context.js';
-import { init, initializeTelemetryAfterTrust } from './entrypoints/init.js';
+import { init } from './entrypoints/init.js';
 import { addToHistory } from './history.js';
 import type { Root } from './ink.js';
 import { launchRepl } from './replLauncher.js';
@@ -2009,7 +2009,7 @@ async function run(): Promise<CommanderCommand> {
     //  - explicit model via --model or ANTHROPIC_MODEL (both feed alias resolution)
     //  - no env override (which short-circuits _CACHED_MAY_BE_STALE before disk)
     //  - flag absent from disk (== null also catches pre-#22279 poisoned null)
-    const explicitModel = options.model || process.env.ANTHROPIC_MODEL;
+    const explicitModel = options.model || process.env.OPENAI_MODEL || process.env.ANTHROPIC_MODEL;
     if ("external" === 'ant' && explicitModel && explicitModel !== 'default' && !hasGrowthBookEnvOverride('tengu_ant_model_override') && getGlobalConfig().cachedGrowthBookFeatures?.['tengu_ant_model_override'] == null) {
       await initializeGrowthBook();
     }
@@ -2594,7 +2594,6 @@ async function run(): Promise<CommanderCommand> {
 
       // Initialize telemetry after env vars are applied so OTEL endpoint env vars and
       // otelHeadersHelper (which requires trust to execute) are available.
-      initializeTelemetryAfterTrust();
 
       // Kick SessionStart hooks now so the subprocess spawn overlaps with
       // MCP connect + plugin init + print.ts import below. loadInitialMessages

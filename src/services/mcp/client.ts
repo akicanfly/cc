@@ -206,9 +206,10 @@ export function isMcpSessionExpiredError(error: Error): boolean {
 }
 
 /**
- * Default timeout for MCP tool calls (effectively infinite - ~27.8 hours).
+ * Default timeout for MCP tool calls.
  */
-const DEFAULT_MCP_TOOL_TIMEOUT_MS = 100_000_000
+const DEFAULT_MCP_TOOL_TIMEOUT_MS = 5 * 60 * 1000
+const MAX_MCP_TOOL_TIMEOUT_MS = 60 * 60 * 1000
 
 /**
  * Cap on MCP tool descriptions and server instructions sent to the model.
@@ -219,13 +220,15 @@ const MAX_MCP_DESCRIPTION_LENGTH = 2048
 
 /**
  * Gets the timeout for MCP tool calls in milliseconds.
- * Uses MCP_TOOL_TIMEOUT environment variable if set, otherwise defaults to ~27.8 hours.
+ * Uses MCP_TOOL_TIMEOUT when it is a positive value of at most one hour.
  */
 function getMcpToolTimeoutMs(): number {
-  return (
-    parseInt(process.env.MCP_TOOL_TIMEOUT || '', 10) ||
-    DEFAULT_MCP_TOOL_TIMEOUT_MS
-  )
+  const configured = Number(process.env.MCP_TOOL_TIMEOUT)
+  return Number.isSafeInteger(configured) &&
+    configured > 0 &&
+    configured <= MAX_MCP_TOOL_TIMEOUT_MS
+    ? configured
+    : DEFAULT_MCP_TOOL_TIMEOUT_MS
 }
 
 import { isClaudeInChromeMCPServer } from '../../utils/claudeInChrome/common.js'

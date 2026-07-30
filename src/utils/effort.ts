@@ -9,6 +9,7 @@ import type { VariantID } from './effort/variantTypes.js'
 import { get3PModelCapabilityOverride } from './model/modelSupportOverrides.js'
 import { isEnvTruthy } from './envUtils.js'
 import type { EffortLevel } from 'src/entrypoints/sdk/runtimeTypes.js'
+import { isOpenAICompatibleConfigured } from './openAICompatibleConfig.js'
 
 export type { EffortLevel }
 
@@ -27,7 +28,7 @@ export type EffortValue = EffortLevel | number
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports the effort parameter.
 export function modelSupportsEffort(model: string): boolean {
   const m = model.toLowerCase()
-  if (process.env.OPENAI_COMPATIBLE_BASE_URL || process.env.OPENAI_BASE_URL) {
+  if (isOpenAICompatibleConfigured()) {
     return true
   }
   if (isEnvTruthy(process.env.CLAUDE_CODE_ALWAYS_ENABLE_EFFORT)) {
@@ -59,7 +60,7 @@ export function modelSupportsEffort(model: string): boolean {
 // @[MODEL LAUNCH]: Add the new model to the allowlist if it supports 'max' effort.
 // Per API docs, 'max' is Opus 4.6 only for public models — other models return an error.
 export function modelSupportsMaxEffort(model: string): boolean {
-  if (process.env.OPENAI_COMPATIBLE_BASE_URL || process.env.OPENAI_BASE_URL) {
+  if (isOpenAICompatibleConfigured()) {
     return true
   }
   const supported3P = get3PModelCapabilityOverride(model, 'max_effort')

@@ -8,11 +8,12 @@
 export const ENTRYPOINT = 'src/entrypoints/cli.tsx'
 
 export const defines: Record<string, string> = {
+  'process.env.USER_TYPE': '"external"',
   'MACRO.VERSION': '"2.1.88"',
   'MACRO.BUILD_TIME': `"${new Date().toISOString()}"`,
-  'MACRO.FEEDBACK_CHANNEL': '"#claude-code-feedback"',
-  'MACRO.ISSUES_EXPLAINER': '"https://github.com/anthropics/claude-code/issues"',
-  'MACRO.NATIVE_PACKAGE_URL': '"@anthropic-ai/claude-code"',
-  'MACRO.PACKAGE_URL': '"@anthropic-ai/claude-code"',
+  'MACRO.FEEDBACK_CHANNEL': '""',
+  'MACRO.ISSUES_EXPLAINER': '"https://github.com/akicanfly/cc/issues"',
+  'MACRO.NATIVE_PACKAGE_URL': '"https://github.com/akicanfly/cc"',
+  'MACRO.PACKAGE_URL': '"cc-openai-compatible"',
   'MACRO.VERSION_CHANGELOG': '""',
 }

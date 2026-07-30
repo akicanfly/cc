@@ -5,13 +5,7 @@ import { isEnvTruthy } from './envUtils.js'
 import { getCanonicalName } from './model/model.js'
 import { getModelCapability } from './model/modelCapabilities.js'
 import { getModelDevEntry } from './model/modelsDevCatalog.js'
-
-// Local predicate mirroring isOpenAICompatibleEnabled() without importing
-// the services/api module — keeps utils/ free of services/ dependencies.
-function isOpenAICompatibleProviderActive(): boolean {
-  return !!(process.env.OPENAI_COMPATIBLE_BASE_URL || process.env.OPENAI_BASE_URL) &&
-    !!(process.env.OPENAI_COMPATIBLE_API_KEY || process.env.OPENAI_API_KEY)
-}
+import { isOpenAICompatibleConfigured } from './openAICompatibleConfig.js'
 
 // Model context window size (200k tokens for all models right now)
 export const MODEL_CONTEXT_WINDOW_DEFAULT = 200_000
@@ -74,7 +68,11 @@ export function getContextWindowForModel(
     }
   }
 
-  // [1m] suffix — explicit client-side opt-in, respected over all detection
+  if (isOpenAICompatibleConfigured()) {
+    return getModelDevEntry(model)?.contextWindow ?? MODEL_CONTEXT_WINDOW_DEFAULT
+  }
+
+  // Legacy internal message-model compatibility for persisted Claude sessions.
   if (has1mContext(model)) {
     return 1_000_000
   }
@@ -95,14 +93,6 @@ export function getContextWindowForModel(
   }
   if (getSonnet1mExpTreatmentEnabled(model)) {
     return 1_000_000
-  }
-  // OpenAI-compatible provider: consult the models.dev catalog for the
-  // model's actual context window. Only kicks in when the OAI provider
-  // is active so we don't shadow first-party Claude model resolution.
-  // The catalog is best-effort: a miss falls through to the default.
-  if (isOpenAICompatibleProviderActive()) {
-    const dev = getModelDevEntry(model)
-    if (dev?.contextWindow) return dev.contextWindow
   }
   if (process.env.USER_TYPE === 'ant') {
     const antModel = resolveAntModel(model)
@@ -168,6 +158,20 @@ export function getModelMaxOutputTokens(model: string): {
 } {
   let defaultTokens: number
   let upperLimit: number
+
+  if (isOpenAICompatibleConfigured()) {
+    const catalogLimit = getModelDevEntry(model)?.maxOutput
+    if (catalogLimit && catalogLimit > 0) {
+      return {
+        default: Math.min(MAX_OUTPUT_TOKENS_DEFAULT, catalogLimit),
+        upperLimit: catalogLimit,
+      }
+    }
+    return {
+      default: MAX_OUTPUT_TOKENS_DEFAULT,
+      upperLimit: MAX_OUTPUT_TOKENS_UPPER_LIMIT,
+    }
+  }
 
   if (process.env.USER_TYPE === 'ant') {
     const antModel = resolveAntModel(model.toLowerCase())
