@@ -38,6 +38,7 @@ bun scripts/build.ts [options]
 |---|---|---|
 | `BUN_COMPILE_TARGET` | Bun target triple, e.g. `bun-linux-x64`, `bun-darwin-arm64`, `bun-windows-x64` | `bun` (host arch) |
 | `BUN_COMPILE_OUTFILE` | Output path for the binary | `dist/bin/cc[.exe]` |
+| `CC_BUILD_VERSION` | Embedded release version matching `2.1.88-vN` or `2.1.88-vN-test.M` | `2.1.88-v0` |
 
 ## Build Macros
 
@@ -45,7 +46,7 @@ bun scripts/build.ts [options]
 
 | Macro | Source | Used by |
 |---|---|---|
-| `MACRO.VERSION` | hardcoded | bridge, update flow, version command |
+| `MACRO.VERSION` | `CC_BUILD_VERSION`, validated against the base in `package.json` | bridge, update flow, version command |
 | `MACRO.BUILD_TIME` | `new Date().toISOString()` at module load | version display, analytics |
 | `MACRO.FEEDBACK_CHANNEL` | hardcoded | error messages |
 | `MACRO.ISSUES_EXPLAINER` | hardcoded | prompt strings |
@@ -78,7 +79,7 @@ The compile step additionally wraps the `bun build --compile` spawn in `try/catc
 
 ## Release Workflow
 
-`.github/workflows/release.yml` runs `bun run build` followed by `bun run build:compile` per matrix entry:
+`.github/workflows/release.yml` validates a versioned bundle once, then runs `bun run build:compile` per matrix entry:
 
 | Target | Outfile |
 |---|---|
@@ -86,6 +87,8 @@ The compile step additionally wraps the `bun build --compile` spawn in `try/catc
 | `bun-linux-arm64` | `dist/bin/cc-linux-arm64` |
 | `bun-linux-x64-musl` | `dist/bin/cc-linux-x64-musl` |
 | `bun-linux-arm64-musl` | `dist/bin/cc-linux-arm64-musl` |
+| `bun-darwin-x64` | `dist/bin/cc-darwin-x64` |
+| `bun-darwin-arm64` | `dist/bin/cc-darwin-arm64` |
 | `bun-windows-x64` | `dist/bin/cc-windows-x64.exe` |
 
 Each binary is uploaded as a release artifact and bundled into a single GitHub release by the `release` job.

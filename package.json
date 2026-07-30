@@ -1,6 +1,6 @@
 {
   "name": "claude-code",
-  "version": "1.0.0",
+  "version": "2.1.88",
   "type": "module",
   "private": true,
   "scripts": {

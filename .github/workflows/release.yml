@@ -3,11 +3,9 @@ name: Release
 on:
   push:
     branches: [master, test]
-    # Defensive: ignore tag pushes even though `branches:` already filters
-    # them out. The version job's `git tag --list` reads the same tags, so
-    # silently pushing a `v*` tag would still be safe — but this keeps the
-    # trigger self-documenting.
-    tags-ignore: ['v*']
+    # Defensive: branch filtering already excludes tag pushes, but keep the
+    # release tag family explicit here.
+    tags-ignore: ['2.1.88-v*']
 
 concurrency:
   # Serialise releases across pushes. Newer pushes wait for the in-flight
@@ -36,41 +34,88 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          base="$(node -p "require('./package.json').version")"
+          base_regex="${base//./\\.}"
           BRANCH="${GITHUB_REF#refs/heads/}"
-          # master: vX.Y.Z (regular). test: vX.Y.Z-test.N (prerelease).
-          if [ "$BRANCH" = "test" ]; then
-            latest="$(git tag --list 'v*-test.*' --sort=-version:refname | head -n1 || true)"
-            if [ -z "$latest" ]; then
-              base="$(git tag --list 'v*' --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)"
-              if [ -z "$base" ]; then
-                next="v0.0.1-test.1"
-              else
-                next="${base}-test.1"
-              fi
-            else
-              counter="${latest##*.}"
-              base="${latest%-test.*}"
-              next="${base}-test.$((counter + 1))"
+
+          # Continue from the old v0.0.N release count during migration, then
+          # use only the new 2.1.88-vN tag family.
+          stable_build=0
+          while IFS= read -r tag; do
+            if [[ "$tag" =~ ^${base_regex}-v([1-9][0-9]*)$ ]]; then
+              candidate="${BASH_REMATCH[1]}"
+              if (( candidate > stable_build )); then stable_build="$candidate"; fi
             fi
+          done < <(git tag --list "${base}-v*")
+          if (( stable_build == 0 )); then
+            while IFS= read -r tag; do
+              if [[ "$tag" =~ ^v0\.0\.([1-9][0-9]*)$ ]]; then
+                candidate="${BASH_REMATCH[1]}"
+                if (( candidate > stable_build )); then stable_build="$candidate"; fi
+              fi
+            done < <(git tag --list 'v0.0.*')
+          fi
+
+          next_build=$((stable_build + 1))
+          if [ "$BRANCH" = "test" ]; then
+            test_build=0
+            while IFS= read -r tag; do
+              if [[ "$tag" =~ ^${base_regex}-v${next_build}-test\.([1-9][0-9]*)$ ]]; then
+                candidate="${BASH_REMATCH[1]}"
+                if (( candidate > test_build )); then test_build="$candidate"; fi
+              fi
+            done < <(git tag --list "${base}-v${next_build}-test.*")
+            next="${base}-v${next_build}-test.$((test_build + 1))"
             prerelease="true"
           else
-            latest="$(git tag --list 'v*' --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)"
-            if [ -z "$latest" ]; then
-              next="v0.0.1"
-            else
-              ver="${latest#v}"
-              IFS='.' read -r major minor patch <<<"$ver"
-              next="v${major}.${minor}.$((patch + 1))"
-            fi
+            next="${base}-v${next_build}"
             prerelease="false"
+          fi
+
+          if git rev-parse --verify "refs/tags/${next}" >/dev/null 2>&1; then
+            echo "error: tag ${next} already exists. Refusing to reuse it."
+            exit 1
           fi
           echo "version=$next" >> "$GITHUB_OUTPUT"
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
           echo "Branch=$BRANCH -> $next (prerelease=$prerelease)"
 
+  validate:
+    name: Test and validate
+    needs: version
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Setup bun cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Run tests
+        run: bun test
+
+      - name: Build bundle with release version
+        env:
+          CC_BUILD_VERSION: ${{ needs.version.outputs.version }}
+        run: bun run build
+
   build:
     name: Build ${{ matrix.target }}
-    needs: version
+    needs: [version, validate]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -87,6 +132,10 @@ jobs:
             outfile: dist/bin/cc-linux-x64-musl
           - target: bun-linux-arm64-musl
             outfile: dist/bin/cc-linux-arm64-musl
+          - target: bun-darwin-x64
+            outfile: dist/bin/cc-darwin-x64
+          - target: bun-darwin-arm64
+            outfile: dist/bin/cc-darwin-arm64
           - target: bun-windows-x64
             outfile: dist/bin/cc-windows-x64.exe
     steps:
@@ -112,13 +161,11 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Build bundle
-        run: bun run build
-
       - name: Build standalone (${{ matrix.target }})
         env:
           BUN_COMPILE_TARGET: ${{ matrix.target }}
           BUN_COMPILE_OUTFILE: ${{ matrix.outfile }}
+          CC_BUILD_VERSION: ${{ needs.version.outputs.version }}
         run: bun run build:compile
 
       - name: Upload binary
@@ -146,8 +193,8 @@ jobs:
           path: dist/bin
           merge-multiple: true
 
-      # Gate the release on all 5 expected outfiles being present. Without
-      # this, a partial-failure matrix (e.g. 4/5 builds succeed) would still
+      # Gate the release on all expected outfiles being present. Without
+      # this, a partial-failure matrix would still
       # ship a release tagged as the full version with one binary missing.
       # The list MUST match the build matrix `outfile` values above; if you
       # add a matrix entry, add it here too.
@@ -160,6 +207,8 @@ jobs:
             "dist/bin/cc-linux-arm64"
             "dist/bin/cc-linux-x64-musl"
             "dist/bin/cc-linux-arm64-musl"
+            "dist/bin/cc-darwin-x64"
+            "dist/bin/cc-darwin-arm64"
             "dist/bin/cc-windows-x64.exe"
           )
           missing=()
@@ -178,22 +227,6 @@ jobs:
           fi
           echo "all ${#expected[@]} binaries present."
 
-      # Refuse to silently reuse an existing tag. softprops/action-gh-release
-      # reuses a tag if one matches tag_name; the version job computes `next`
-      # from the latest tag, but doesn't check that `next` doesn't already
-      # exist (e.g. from a different branch's history).
-      - name: Verify tag does not already exist
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag="${{ needs.version.outputs.version }}"
-          if git rev-parse --verify "refs/tags/${tag}" >/dev/null 2>&1; then
-            echo "error: tag ${tag} already exists. Refusing to reuse."
-            git log --oneline -1 "refs/tags/${tag}" || true
-            exit 1
-          fi
-          echo "tag ${tag} is new."
-
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
@@ -206,6 +239,8 @@ jobs:
             dist/bin/cc-linux-arm64
             dist/bin/cc-linux-x64-musl
             dist/bin/cc-linux-arm64-musl
+            dist/bin/cc-darwin-x64
+            dist/bin/cc-darwin-arm64
             dist/bin/cc-windows-x64.exe
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
