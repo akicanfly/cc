@@ -1,17 +1,36 @@
 {
-  "name": "claude-code",
+  "name": "ccc-openai-compatible",
   "version": "2.1.88",
+  "description": "Claude Code rebuilt for OpenAI-compatible APIs",
   "type": "module",
-  "private": true,
+  "bin": {
+    "ccc": "dist/cli.js"
+  },
+  "files": [
+    "dist/cli.js",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/akicanfly/cc.git"
+  },
+  "bugs": {
+    "url": "https://github.com/akicanfly/cc/issues"
+  },
+  "homepage": "https://github.com/akicanfly/cc#readme",
+  "engines": {
+    "bun": ">=1.3.0"
+  },
   "scripts": {
     "build": "bun scripts/build.ts",
     "build:compile": "bun scripts/build.ts -- --compile",
+    "package": "bun scripts/package.ts",
     "dev": "bun scripts/dev.ts",
     "test": "bun test",
     "start": "bun run dist/cli.js",
     "version": "bun run dist/cli.js --version",
-    "install:cc": "bun run build:compile && bun scripts/install.ts",
-    "uninstall:cc": "bun scripts/install.ts --uninstall"
+    "install:ccc": "bun run build:compile && bun scripts/install.ts",
+    "uninstall:ccc": "bun scripts/install.ts --uninstall"
   },
   "dependencies": {
     "@alcalzone/ansi-tokenize": "*",

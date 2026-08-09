@@ -29,6 +29,7 @@ const result = await Bun.build({
   target: 'bun',
   outdir: 'dist',
   define: defines,
+  banner: '#!/usr/bin/env bun',
   minify: true,
 })
 
@@ -56,9 +57,9 @@ for (const output of result.outputs) {
   console.log(`${output.path} ${sizeInMb.toFixed(2)} MB`)
 }
 
-// ---- --compile: produce standalone `cc` binary -----------------------------
+// ---- --compile: produce standalone `ccc` binary ----------------------------
 //
-// `bun run build -- --compile` produces a standalone `cc` binary.
+// `bun run build -- --compile` produces a standalone `ccc` binary.
 // `BUN_COMPILE_TARGET` (e.g. `bun-linux-x64`) and `BUN_COMPILE_OUTFILE` (path)
 // override the defaults. Compiles from the source entrypoint (not dist/cli.js) —
 // re-bundling the already-bundled file corrupts the pre-compiled React Compiler
@@ -66,7 +67,7 @@ for (const output of result.outputs) {
 if (args.includes('--compile')) {
   const target = process.env.BUN_COMPILE_TARGET ?? 'bun'
   const defaultExt = process.platform === 'win32' ? '.exe' : ''
-  const defaultOutfile = `dist/bin/cc${defaultExt}`
+  const defaultOutfile = `dist/bin/ccc${defaultExt}`
   const outfile = process.env.BUN_COMPILE_OUTFILE ?? defaultOutfile
 
   // Warn if the target's host part doesn't match this machine. Cross-compile

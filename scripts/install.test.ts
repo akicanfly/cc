@@ -35,9 +35,9 @@ async function runInstaller(args: string[]) {
 }
 
 describe('custom standalone installer', () => {
-  test('installs platform-suffixed release assets under the cc command name', async () => {
+  test('installs platform-suffixed release assets under the ccc command name', async () => {
     const root = await temporaryDirectory()
-    const source = join(root, 'cc-linux-x64')
+    const source = join(root, 'ccc-linux-x64')
     const target = join(root, 'bin')
     await writeFile(source, `#!/bin/sh\n${'#'.repeat(2048)}\n`)
     await chmod(source, 0o755)
@@ -51,12 +51,12 @@ describe('custom standalone installer', () => {
     ])
 
     expect(result.exitCode).toBe(0)
-    expect(result.stdout).toContain(`Would install to: ${join(target, 'cc')}`)
+    expect(result.stdout).toContain(`Would install to: ${join(target, 'ccc')}`)
   })
 
   test('rejects a suspiciously small source binary', async () => {
     const root = await temporaryDirectory()
-    const source = join(root, 'cc')
+    const source = join(root, 'ccc')
     await writeFile(source, '#!/bin/sh\n')
     await chmod(source, 0o755)
 

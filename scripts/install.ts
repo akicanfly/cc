@@ -1,4 +1,4 @@
-// Install the standalone `cc` binary into a writable directory on PATH.
+// Install the standalone `ccc` binary into a writable directory on PATH.
 //
 // Usage:
 //   bun scripts/install.ts [options]
@@ -10,7 +10,7 @@
 //   --uninstall         Remove the resolved target and exit.
 //   --help              Print this message.
 //
-// Resolution order for the source: --outfile > $BUN_COMPILE_OUTFILE > dist/bin/cc[.exe].
+// Resolution order for the source: --outfile > $BUN_COMPILE_OUTFILE > dist/bin/ccc[.exe].
 // Resolution order for the target: --target > $CC_INSTALL_DIR > $HOME/.local/bin > $PREFIX/bin.
 
 import {
@@ -54,7 +54,7 @@ Options:
 
 Env vars:
   CC_INSTALL_DIR      First-preference install directory.
-  BUN_COMPILE_OUTFILE Build output path (defaults to dist/bin/cc[.exe]).
+  BUN_COMPILE_OUTFILE Build output path (defaults to dist/bin/ccc[.exe]).
   HOME                Used for ~/.local/bin fallback.
   PREFIX              Used for $PREFIX/bin fallback (Nix, Termux, etc).`)
   process.exit(0)
@@ -73,7 +73,7 @@ if (dryRun && uninstall) {
 // ---- Source resolution ----------------------------------------------------
 
 const isWindows = process.platform === 'win32'
-const defaultName = isWindows ? 'cc.exe' : 'cc'
+const defaultName = isWindows ? 'ccc.exe' : 'ccc'
 
 function defaultSourcePath(): string {
   return join(import.meta.dir, '..', 'dist', 'bin', defaultName)
@@ -231,7 +231,7 @@ function tryInstall(dir: string): { ok: true; target: string } | { ok: false; er
 
 function tryUninstall(target: string): { ok: true } | { ok: false; err: AttemptError } {
   // Refuse to remove anything outside the candidate dirs we resolved — i.e.
-  // we won't touch /usr/bin/cc or arbitrary user files. Also refuse if the
+  // we won't touch /usr/bin/ccc or arbitrary user files. Also refuse if the
   // target's directory is not in our candidate list.
   const dir = dirname(target)
   if (!candidates.includes(dir) && !candidates.map(r => resolve(r)).includes(resolve(dir))) {
@@ -384,19 +384,19 @@ function checkPathShadow(target: string): { onPath: boolean; targetDir: string }
   const pathDirs = (process.env.PATH ?? '').split(isWindows ? ';' : ':').filter(Boolean)
   const onPath = pathDirs.some(d => resolve(d) === resolve(targetDir))
   if (onPath) {
-    // Probe `which cc` / `where cc` to detect a different binary ahead of us.
+    // Probe `which ccc` / `where ccc` to detect a different binary ahead of us.
     const probe = process.platform === 'win32' ? 'where' : 'which'
     try {
-      const out = spawn(probe, [isWindows ? 'cc.exe' : 'cc'], { stdio: ['ignore', 'pipe', 'pipe'] })
+      const out = spawn(probe, [isWindows ? 'ccc.exe' : 'ccc'], { stdio: ['ignore', 'pipe', 'pipe'] })
       let buf = ''
       out.stdout?.on('data', (chunk: Buffer) => { buf += chunk.toString() })
       out.on('close', () => {
         const found = buf.split(/\r?\n/).map(s => s.trim()).filter(Boolean)
         const conflict = found.find(p => resolve(p) !== resolve(target))
         if (conflict) {
-          console.warn(`warning: \`cc\` on PATH resolves to ${conflict} (not ${target}).`)
+          console.warn(`warning: \`ccc\` on PATH resolves to ${conflict} (not ${target}).`)
           if (isWindows) {
-            console.warn(`  Open a new terminal so the new \`cc.exe\` is picked up.`)
+            console.warn(`  Open a new terminal so the new \`ccc.exe\` is picked up.`)
           } else {
             console.warn(`  Run \`hash -r\` (POSIX) or restart your shell to refresh the lookup cache.`)
           }

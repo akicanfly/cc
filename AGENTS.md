@@ -2,13 +2,13 @@
 
 ## What This Is
 
-This is a **custom rebuild of `@anthropic-ai/claude-code` v2.1.88** that replaces the original Node.js bundle with a **Bun-based build** targeting any **OpenAI-compatible API provider**. The `cc` CLI binary forwards all requests through an Anthropic-to-OpenAI protocol adapter instead of calling `api.anthropic.com`.
+This is a **custom rebuild of `@anthropic-ai/claude-code` v2.1.88** that replaces the original Node.js bundle with a **Bun-based build** targeting any **OpenAI-compatible API provider**. The `ccc` CLI binary forwards all requests through an Anthropic-to-OpenAI protocol adapter instead of calling `api.anthropic.com`.
 
 ## Build
 
 ```
 bun run build          # bundles dist/cli.js (~10.7 MB)
-bun run build:compile  # produces standalone binary dist/bin/cc
+bun run build:compile  # produces standalone binary dist/bin/ccc
 ```
 
 ## OpenAI Compatibility Layer

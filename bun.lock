@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "claude-code",
+      "name": "ccc-openai-compatible",
       "dependencies": {
         "@alcalzone/ansi-tokenize": "*",
         "@ant/claude-for-chrome-mcp": "file:stubs/@ant/claude-for-chrome-mcp",

@@ -125,24 +125,25 @@ jobs:
       matrix:
         include:
           - target: bun-linux-x64
-            outfile: dist/bin/cc-linux-x64
+            outfile: dist/bin/ccc-linux-x64
           - target: bun-linux-arm64
-            outfile: dist/bin/cc-linux-arm64
+            outfile: dist/bin/ccc-linux-arm64
           - target: bun-linux-x64-musl
-            outfile: dist/bin/cc-linux-x64-musl
+            outfile: dist/bin/ccc-linux-x64-musl
           - target: bun-linux-arm64-musl
-            outfile: dist/bin/cc-linux-arm64-musl
+            outfile: dist/bin/ccc-linux-arm64-musl
           - target: bun-darwin-x64
-            outfile: dist/bin/cc-darwin-x64
+            outfile: dist/bin/ccc-darwin-x64
           - target: bun-darwin-arm64
-            outfile: dist/bin/cc-darwin-arm64
+            outfile: dist/bin/ccc-darwin-arm64
           - target: bun-windows-x64
-            outfile: dist/bin/cc-windows-x64.exe
+            outfile: dist/bin/ccc-windows-x64.exe
+          - target: bun-windows-arm64
+            outfile: dist/bin/ccc-windows-arm64.exe
     steps:
       - uses: actions/checkout@v4
         with:
-          # Build job only needs the working tree, not history. The version
-          # job above is the one that needs fetch-depth: 0 for tag reads.
+          # Build jobs only need the working tree; version computes tags.
           fetch-depth: 1
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -171,13 +172,55 @@ jobs:
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
-          name: cc-${{ needs.version.outputs.version }}-${{ matrix.target }}
+          name: ccc-${{ needs.version.outputs.version }}-${{ matrix.target }}
           path: ${{ matrix.outfile }}
+          if-no-files-found: error
+
+  package:
+    name: Build portable package
+    needs: [version, validate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Setup bun cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: ${{ runner.os }}-bun-${{ hashFiles('**/bun.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-bun-
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Build portable bundle
+        env:
+          CC_BUILD_VERSION: ${{ needs.version.outputs.version }}
+        run: bun run build
+
+      - name: Pack dependency-free package
+        env:
+          CC_BUILD_VERSION: ${{ needs.version.outputs.version }}
+        run: bun run package
+
+      - name: Upload portable package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ccc-${{ needs.version.outputs.version }}-package
+          path: dist/package/ccc.tgz
           if-no-files-found: error
 
   release:
     name: Publish release
-    needs: [version, build]
+    needs: [version, build, package]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Defensive: refuse to publish on non-push events. The trigger is already
@@ -187,45 +230,52 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download all binaries
+      - name: Download standalone binaries
         uses: actions/download-artifact@v4
         with:
           path: dist/bin
+          pattern: ccc-${{ needs.version.outputs.version }}-bun-*
           merge-multiple: true
 
-      # Gate the release on all expected outfiles being present. Without
-      # this, a partial-failure matrix would still
-      # ship a release tagged as the full version with one binary missing.
-      # The list MUST match the build matrix `outfile` values above; if you
-      # add a matrix entry, add it here too.
-      - name: Verify all binaries are present
+      - name: Download portable package
+        uses: actions/download-artifact@v4
+        with:
+          name: ccc-${{ needs.version.outputs.version }}-package
+          path: dist/package
+
+      - name: Verify all release assets are present
         shell: bash
         run: |
           set -euo pipefail
           expected=(
-            "dist/bin/cc-linux-x64"
-            "dist/bin/cc-linux-arm64"
-            "dist/bin/cc-linux-x64-musl"
-            "dist/bin/cc-linux-arm64-musl"
-            "dist/bin/cc-darwin-x64"
-            "dist/bin/cc-darwin-arm64"
-            "dist/bin/cc-windows-x64.exe"
+            "dist/bin/ccc-linux-x64"
+            "dist/bin/ccc-linux-arm64"
+            "dist/bin/ccc-linux-x64-musl"
+            "dist/bin/ccc-linux-arm64-musl"
+            "dist/bin/ccc-darwin-x64"
+            "dist/bin/ccc-darwin-arm64"
+            "dist/bin/ccc-windows-x64.exe"
+            "dist/bin/ccc-windows-arm64.exe"
+            "dist/package/ccc.tgz"
           )
           missing=()
-          for f in "${expected[@]}"; do
-            if [ ! -f "$f" ]; then
-              missing+=("$f")
+          for file in "${expected[@]}"; do
+            if [ ! -f "$file" ]; then
+              missing+=("$file")
             fi
           done
           if [ "${#missing[@]}" -gt 0 ]; then
-            echo "error: ${#missing[@]} binary/binarie(s) missing from the download:"
-            for m in "${missing[@]}"; do
-              echo "  - $m"
-            done
-            echo "refusing to publish a partial release. Check the build matrix for failures."
+            printf 'error: missing release asset: %s\n' "${missing[@]}"
             exit 1
           fi
-          echo "all ${#expected[@]} binaries present."
+          echo "all ${#expected[@]} release assets are present."
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum dist/bin/ccc-* dist/package/ccc.tgz \
+            | sed -E 's#  .*/#  #' > SHA256SUMS
 
       - name: Create release
         uses: softprops/action-gh-release@v2
@@ -236,12 +286,15 @@ jobs:
           prerelease: ${{ needs.version.outputs.prerelease == 'true' }}
           generate_release_notes: true
           files: |
-            dist/bin/cc-linux-x64
-            dist/bin/cc-linux-arm64
-            dist/bin/cc-linux-x64-musl
-            dist/bin/cc-linux-arm64-musl
-            dist/bin/cc-darwin-x64
-            dist/bin/cc-darwin-arm64
-            dist/bin/cc-windows-x64.exe
+            dist/bin/ccc-linux-x64
+            dist/bin/ccc-linux-arm64
+            dist/bin/ccc-linux-x64-musl
+            dist/bin/ccc-linux-arm64-musl
+            dist/bin/ccc-darwin-x64
+            dist/bin/ccc-darwin-arm64
+            dist/bin/ccc-windows-x64.exe
+            dist/bin/ccc-windows-arm64.exe
+            dist/package/ccc.tgz
+            SHA256SUMS
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

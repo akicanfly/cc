@@ -29,6 +29,6 @@ export const defines: Record<string, string> = {
   'MACRO.FEEDBACK_CHANNEL': '""',
   'MACRO.ISSUES_EXPLAINER': '"https://github.com/akicanfly/cc/issues"',
   'MACRO.NATIVE_PACKAGE_URL': '"https://github.com/akicanfly/cc"',
-  'MACRO.PACKAGE_URL': '"cc-openai-compatible"',
+  'MACRO.PACKAGE_URL': '"ccc-openai-compatible"',
   'MACRO.VERSION_CHANGELOG': '""',
 }
