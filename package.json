@@ -3,6 +3,7 @@
   "version": "2.1.88",
   "description": "Claude Code rebuilt for OpenAI-compatible APIs",
   "type": "module",
+  "packageManager": "bun@1.3.10",
   "bin": {
     "ccc": "dist/cli.js"
   },
@@ -19,12 +20,13 @@
   },
   "homepage": "https://github.com/akicanfly/cc#readme",
   "engines": {
-    "bun": ">=1.3.0"
+    "bun": ">=1.3.10"
   },
   "scripts": {
     "build": "bun scripts/build.ts",
     "build:compile": "bun scripts/build.ts -- --compile",
     "package": "bun scripts/package.ts",
+    "smoke": "bun run dist/cli.js --version",
     "dev": "bun scripts/dev.ts",
     "test": "bun test",
     "start": "bun run dist/cli.js",

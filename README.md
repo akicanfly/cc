@@ -11,6 +11,8 @@ bun link
 ccc --version
 ```
 
+Bun 1.3.10 or newer is required.
+
 Install the latest stable prebuilt Bun package directly from GitHub Releases:
 
 ```sh
