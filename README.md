@@ -16,6 +16,7 @@ Bun 1.3.10 or newer is required.
 Install the latest stable prebuilt Bun package directly from GitHub Releases:
 
 ```sh
+bun remove -g ccc-openai-compatible
 bun install -g https://github.com/akicanfly/cc/releases/latest/download/ccc.tgz
 ```
 
