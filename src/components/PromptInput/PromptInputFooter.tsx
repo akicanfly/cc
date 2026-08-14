@@ -1,6 +1,6 @@
 import { feature } from 'bun:bundle';
 import * as React from 'react';
-import { memo, type ReactNode, useMemo, useRef } from 'react';
+import { memo, type ReactNode, useMemo, useRef, useSyncExternalStore } from 'react';
 import { isBridgeEnabled } from '../../bridge/bridgeEnabled.js';
 import { getBridgeStatus } from '../../bridge/bridgeStatusUtil.js';
 import { useSetPromptOverlay } from '../../context/promptOverlayContext.js';
@@ -18,6 +18,7 @@ import type { AutoUpdaterResult } from '../../utils/autoUpdater.js';
 import { isFullscreenEnvEnabled } from '../../utils/fullscreen.js';
 import { isUndercover } from '../../utils/undercover.js';
 import { useMainLoopModel } from '../../hooks/useMainLoopModel.js';
+import { getActiveOpenAICompatibleProviderName, getOpenAICompatibleConfigVersion, subscribeToOpenAICompatibleConfig } from '../../utils/openAICompatibleConfig.js';
 import { CoordinatorTaskPanel, useCoordinatorTaskCount } from '../CoordinatorAgentStatus.js';
 import { getLastAssistantMessageId, StatusLine, statusLineShouldDisplay } from '../StatusLine.js';
 import { Notifications } from './Notifications.js';
@@ -158,7 +159,9 @@ type BridgeStatusProps = {
 };
 function ModelIndicator(): React.ReactNode {
   const model = useMainLoopModel();
-  return <Text dimColor>{model}</Text>;
+  const configVersion = useSyncExternalStore(subscribeToOpenAICompatibleConfig, getOpenAICompatibleConfigVersion, getOpenAICompatibleConfigVersion);
+  const provider = useMemo(() => getActiveOpenAICompatibleProviderName(), [configVersion]);
+  return <Text dimColor>{provider ? `(${provider}) ${model}` : model}</Text>;
 }
 function BridgeStatusIndicator({
   bridgeSelected
