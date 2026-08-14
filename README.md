@@ -13,6 +13,24 @@ ccc --version
 
 Bun 1.3.10 or newer is required.
 
+## Configure a provider
+
+Start `ccc`, then run:
+
+```text
+/provider
+```
+
+The profile manager can add, edit, delete, and switch between named providers.
+Each profile contains an OpenAI-compatible base URL and a masked API key. The
+active profile and saved profiles live in `~/.claude/openai-compatible.json`
+with user-only permissions. Changes take effect immediately.
+Without environment variables or a saved profile, `ccc` defaults to the
+keyless `opencode` profile at `https://opencode.ai/zen/v1`.
+`OPENAI_COMPATIBLE_BASE_URL` and
+`OPENAI_COMPATIBLE_API_KEY` (and their `OPENAI_*` aliases) continue to override
+the saved values.
+
 Install the latest stable prebuilt Bun package directly from GitHub Releases:
 
 ```sh

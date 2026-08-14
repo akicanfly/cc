@@ -618,7 +618,7 @@ export async function main() {
         parseConnectUrl
       } = await import('./server/parseConnectUrl.js');
       const parsed = parseConnectUrl(ccUrl);
-      _pendingConnect.dangerouslySkipPermissions = rawCliArgs.includes('--dangerously-skip-permissions');
+      _pendingConnect.dangerouslySkipPermissions = rawCliArgs.includes('--dangerously-skip-permissions') || rawCliArgs.includes('--yolo');
       if (rawCliArgs.includes('-p') || rawCliArgs.includes('--print')) {
         // Headless: rewrite to internal `open` subcommand
         const stripped = rawCliArgs.filter((_, i) => i !== ccIdx);
@@ -718,8 +718,10 @@ export async function main() {
         rawCliArgs.splice(localIdx, 1);
       }
       const dspIdx = rawCliArgs.indexOf('--dangerously-skip-permissions');
-      if (dspIdx !== -1) {
+      if (dspIdx !== -1 || rawCliArgs.includes('--yolo')) {
         _pendingSSH.dangerouslySkipPermissions = true;
+      }
+      if (dspIdx !== -1) {
         rawCliArgs.splice(dspIdx, 1);
       }
       const pmIdx = rawCliArgs.indexOf('--permission-mode');
@@ -3805,6 +3807,11 @@ async function run(): Promise<CommanderCommand> {
       }, renderAndRun);
     }
   }).version(`${MACRO.VERSION} (Claude Code)`, '-v, --version', 'Output the version number');
+
+  program.addOption(new Option('--yolo', 'Enable and immediately bypass all permission checks. Equivalent to --allow-dangerously-skip-permissions --dangerously-skip-permissions.').implies({
+    allowDangerouslySkipPermissions: true,
+    dangerouslySkipPermissions: true
+  }));
 
   // Worktree flags
   program.option('-w, --worktree [name]', 'Create a new git worktree for this session (optionally specify a name)');
