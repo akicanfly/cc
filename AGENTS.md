@@ -38,3 +38,16 @@ Heavy cloud SDKs (AWS Bedrock, Azure Foundry, GCP Vertex, OpenTelemetry, MCP bri
 ## USER_TYPE Gates
 
 `process.env.USER_TYPE === 'ant'` gates 250+ internal-only features across 80+ files (documented in `ANT.md`).
+
+## Reuse Existing Implementations First
+
+Before implementing a new feature, behavior, component, command, utility, or integration, search the codebase for an existing implementation or a closely related pattern. Inspect relevant call sites, shared utilities, abstractions, tests, and upstream/original code before deciding that new code is necessary.
+
+- Prefer reusing or extending an existing implementation over creating a parallel one.
+- Keep behavior in the established abstraction or shared module when one already exists.
+- Follow existing project conventions and patterns unless there is a concrete reason not to.
+- Avoid duplicating logic, components, types, configuration handling, validation, or tests.
+- If the existing implementation is insufficient, explain the gap and make the smallest coherent extension that satisfies the request.
+- Create a new implementation only after confirming that no suitable reusable implementation exists.
+
+The goal is to preserve consistency, reduce maintenance cost, and avoid speculative or redundant code.
