@@ -202,9 +202,8 @@ export function getDefaultMainLoopModelSetting(): ModelName | ModelAlias {
     return getDefaultOpusModel() + (isOpus1mMergeEnabled() ? '[1m]' : '')
   }
 
-  // PAYG (1P and 3P), Enterprise, Team Standard, and Pro get Sonnet as default
-  // Note that PAYG (3P) may default to an older Sonnet model
-  return 'gpt-5'
+  // Default to the free Zen model served over POST /responses.
+  return 'muse-spark-1.3-contributor-free'
 }
 
 /**

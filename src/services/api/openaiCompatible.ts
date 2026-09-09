@@ -18,7 +18,14 @@ import {
   shouldSendOpenAISamplingParams,
   shouldSendOpenAIStreamOptions,
   shouldUseMaxCompletionTokens,
+  shouldUseResponsesAPI,
+  zenHeaders,
 } from './openaiCompatibleQuirks.js'
+import {
+  createResponsesMessage,
+  fromResponsesStream,
+  toResponsesRequest,
+} from './openaiCompatibleResponses.js'
 import { getVariantBlob } from 'src/utils/effort/modelVariants.js'
 import type { VariantBlob } from 'src/utils/effort/variantTypes.js'
 import { isVariantID } from 'src/utils/effort/variantTypes.js'
@@ -227,6 +234,22 @@ async function createOpenAICompatibleMessage(
   fetchOverride: ClientOptions['fetch'] | undefined,
 ): Promise<Record<string, unknown>> {
   const config = requireOpenAICompatibleConfig()
+  if (shouldUseResponsesAPI(params.model, config.baseURL)) {
+    const response = await postOpenAIResponse({
+      config,
+      params,
+      stream: false,
+      signal,
+      timeoutMs,
+      fetchOverride,
+    })
+    const parsed = (await response.json()) as Parameters<typeof createResponsesMessage>[0]
+    return createResponsesMessage(
+      parsed,
+      params,
+      response.headers.get('x-request-id'),
+    )
+  }
   const response = await postOpenAIChatCompletion({
     config,
     params,
@@ -296,6 +319,25 @@ async function createOpenAICompatibleStream(
 }> {
   const config = requireOpenAICompatibleConfig()
   const controller = linkedAbortController(signal)
+  if (shouldUseResponsesAPI(params.model, config.baseURL)) {
+    const response = await postOpenAIResponse({
+      config,
+      params,
+      stream: true,
+      signal: controller.signal,
+      timeoutMs,
+      fetchOverride,
+    })
+    if (!response.body) {
+      throw new Error('Responses request failed: response body is empty')
+    }
+    const requestId = response.headers.get('x-request-id')
+    return {
+      data: fromResponsesStream(response.body, params, controller),
+      response,
+      request_id: requestId,
+    }
+  }
   const response = await postOpenAIChatCompletion({
     config,
     params,
@@ -343,6 +385,7 @@ async function postOpenAIChatCompletion({
           signal: requestSignal,
         headers: {
           ...config.headers,
+          ...zenHeaders(config.baseURL, config.headers),
           ...(config.apiKey
             ? { Authorization: `Bearer ${config.apiKey}` }
             : {}),
@@ -367,6 +410,62 @@ async function postOpenAIChatCompletion({
     if (error instanceof APIError) throw error
     throw new APIConnectionError({
       message: 'OpenAI-compatible request failed',
+      cause: error instanceof Error ? error : undefined,
+    })
+  }
+}
+
+async function postOpenAIResponse({
+  config,
+  params,
+  stream,
+  signal,
+  timeoutMs,
+  fetchOverride,
+}: {
+  config: OpenAICompatibleConfig
+  params: BetaMessageStreamParams
+  stream: boolean
+  signal: AbortSignal | undefined
+  timeoutMs: number | undefined
+  fetchOverride: ClientOptions['fetch'] | undefined
+}): Promise<Response> {
+  const timeout = timeoutSignal(timeoutMs ?? config.timeoutMs)
+  const requestSignal = combineAbortSignals(signal, timeout)
+
+  try {
+    const response = await (fetchOverride ?? globalThis.fetch)(
+      `${config.baseURL.replace(/\/+$/, '')}/responses`,
+      {
+        method: 'POST',
+          signal: requestSignal,
+        headers: {
+          ...config.headers,
+          ...zenHeaders(config.baseURL, config.headers),
+          ...(config.apiKey
+            ? { Authorization: `Bearer ${config.apiKey}` }
+            : {}),
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(toResponsesRequest(params, stream)),
+      },
+    )
+
+    if (!response.ok) {
+      throw await createOpenAICompatibleResponseError(response, 'responses request')
+    }
+    return response
+  } catch (error) {
+    if (signal?.aborted) throw new APIUserAbortError()
+    if (timeout.aborted) {
+      throw new APIConnectionTimeoutError({
+        message: 'Responses request timed out',
+        cause: error instanceof Error ? error : undefined,
+      })
+    }
+    if (error instanceof APIError) throw error
+    throw new APIConnectionError({
+      message: 'Responses request failed',
       cause: error instanceof Error ? error : undefined,
     })
   }

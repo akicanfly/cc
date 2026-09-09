@@ -84,16 +84,22 @@ function formatMessage(
 ): string {
   const providerMessage = asString(error?.message)
   const fallback = truncate(rawBody.trim()) || statusText || 'Unknown provider error'
-  const hint = errorHint(status, asString(error?.code))
+  const hint = errorHint(status, asString(error?.code), providerMessage ?? rawBody)
   return `OpenAI-compatible ${operation} failed: ${providerMessage || fallback}${hint ? ` ${hint}` : ''}`
 }
 
-function errorHint(status: number | undefined, code: string | undefined): string {
+function errorHint(status: number | undefined, code: string | undefined, body: string): string {
+  if (body.includes('MissingSessionID')) {
+    return 'The Zen free tier needs an x-opencode-session header. It is sent automatically; if you set OPENAI_COMPATIBLE_HEADERS manually, include x-opencode-session.'
+  }
+  if (status === 500 && body.includes('Internal server error')) {
+    return 'The free muse-spark model only works through POST /responses, which this client selects automatically. Check OPENAI_COMPATIBLE_USE_RESPONSES is not set to false.'
+  }
   if (status === 401 || status === 403) {
     return 'Check the configured API key and provider permissions.'
   }
   if (status === 404) {
-    return 'Check the base URL, /chat/completions path, and selected model.'
+    return 'Check the base URL, /chat/completions or /responses path, and selected model.'
   }
   if (status === 429 || code === 'rate_limit_exceeded') {
     return 'The provider reported a rate limit; retry later or lower concurrency.'
