@@ -7,8 +7,10 @@ import { join, normalize, posix, sep } from 'path'
 import { hasAutoMemPathOverride, isAutoMemPath } from 'src/memdir/paths.js'
 import { isAgentMemoryPath } from 'src/tools/AgentTool/agentMemory.js'
 import {
+  AGENTS_FOLDER_PERMISSION_PATTERN,
   CLAUDE_FOLDER_PERMISSION_PATTERN,
   FILE_EDIT_TOOL_NAME,
+  GLOBAL_AGENTS_FOLDER_PERMISSION_PATTERN,
   GLOBAL_CLAUDE_FOLDER_PERMISSION_PATTERN,
 } from 'src/tools/FileEditTool/constants.js'
 import type { z } from 'zod/v4'
@@ -106,8 +108,16 @@ export function getClaudeSkillScope(
 
   const bases = [
     {
+      dir: expandPath(join(getOriginalCwd(), '.agents', 'skills')),
+      prefix: '/.agents/skills/',
+    },
+    {
       dir: expandPath(join(getOriginalCwd(), '.claude', 'skills')),
       prefix: '/.claude/skills/',
+    },
+    {
+      dir: expandPath(join(homedir(), '.agents', 'skills')),
+      prefix: '~/.agents/skills/',
     },
     {
       dir: expandPath(join(homedir(), '.claude', 'skills')),
@@ -227,17 +237,24 @@ function isClaudeConfigFilePath(filePath: string): boolean {
     return true
   }
 
-  // Check if file is within .claude/commands or .claude/agents directories
-  // using proper path segment validation (not string matching with includes())
+  // Check if file is within commands, agents, or skills directories
+  // under .claude/ or .agents/, using proper path segment validation
+  // (not string matching with includes()).
   // pathInWorkingPath now handles case-insensitive comparison to prevent bypasses
   const commandsDir = join(getOriginalCwd(), '.claude', 'commands')
   const agentsDir = join(getOriginalCwd(), '.claude', 'agents')
   const skillsDir = join(getOriginalCwd(), '.claude', 'skills')
+  const agentsCommandsDir = join(getOriginalCwd(), '.agents', 'commands')
+  const agentsAgentsDir = join(getOriginalCwd(), '.agents', 'agents')
+  const agentsSkillsDir = join(getOriginalCwd(), '.agents', 'skills')
 
   return (
     pathInWorkingPath(filePath, commandsDir) ||
     pathInWorkingPath(filePath, agentsDir) ||
-    pathInWorkingPath(filePath, skillsDir)
+    pathInWorkingPath(filePath, skillsDir) ||
+    pathInWorkingPath(filePath, agentsCommandsDir) ||
+    pathInWorkingPath(filePath, agentsAgentsDir) ||
+    pathInWorkingPath(filePath, agentsSkillsDir)
   )
 }
 
@@ -1271,19 +1288,23 @@ export function checkWritePermissionForTool<Input extends AnyObject>(
     'allow',
   )
   if (claudeFolderAllowRule) {
-    // Check if this rule is scoped under .claude/ (project or global).
-    // Accepts both the broad patterns ('/.claude/**', '~/.claude/**') and
-    // narrowed ones like '/.claude/skills/my-skill/**' so users can grant
+    // Check if this rule is scoped under .claude/ or .agents/ (project or global).
+    // Accepts both the broad patterns ('/.claude/**', '~/.agents/**') and
+    // narrowed ones like '/.agents/skills/my-skill/**' so users can grant
     // session access to a single skill without also exposing settings.json
     // or hooks/. The rule already matched the path via matchingRuleForInput;
     // this is an additional scope check. Reject '..' to prevent a rule like
-    // '/.claude/../**' from leaking this bypass outside .claude/.
+    // '/.agents/../**' from leaking this bypass outside .agents/.
     const ruleContent = claudeFolderAllowRule.ruleValue.ruleContent
     if (
       ruleContent &&
       (ruleContent.startsWith(CLAUDE_FOLDER_PERMISSION_PATTERN.slice(0, -2)) ||
         ruleContent.startsWith(
           GLOBAL_CLAUDE_FOLDER_PERMISSION_PATTERN.slice(0, -2),
+        ) ||
+        ruleContent.startsWith(AGENTS_FOLDER_PERMISSION_PATTERN.slice(0, -2)) ||
+        ruleContent.startsWith(
+          GLOBAL_AGENTS_FOLDER_PERMISSION_PATTERN.slice(0, -2),
         )) &&
       !ruleContent.includes('..') &&
       ruleContent.endsWith('/**')

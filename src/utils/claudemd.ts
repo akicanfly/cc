@@ -37,6 +37,7 @@ import {
   join,
   parse,
   relative,
+  resolve,
   sep,
 } from 'path'
 import picomatch from 'picomatch'
@@ -52,10 +53,12 @@ import {
   getCurrentProjectConfig,
   getManagedClaudeRulesDir,
   getMemoryPath,
+  getUserAgentsRulesDir,
   getUserClaudeRulesDir,
 } from './config.js'
 import { logForDebugging } from './debug.js'
 import { logForDiagnosticsNoPII } from './diagLogs.js'
+import { CONFIG_ROOT_NAMES } from './markdownConfigLoader.js'
 import { getClaudeConfigHomeDir, isEnvTruthy } from './envUtils.js'
 import { getErrnoCode } from './errors.js'
 import { normalizePathForComparison } from './file.js'
@@ -701,6 +704,8 @@ export async function processMdRules({
   includeExternal,
   conditionalRule,
   visitedDirs = new Set(),
+  excludeFrom,
+  topRulesDir,
 }: {
   rulesDir: string
   type: MemoryType
@@ -708,6 +713,11 @@ export async function processMdRules({
   includeExternal: boolean
   conditionalRule: boolean
   visitedDirs?: Set<string>
+  // Skip files whose path relative to the walked top directory is in
+  // excludeFrom. Used to let .agents/rules twins win over their
+  // .claude/rules counterparts.
+  excludeFrom?: Set<string>
+  topRulesDir?: string
 }): Promise<MemoryFileInfo[]> {
   if (visitedDirs.has(rulesDir)) {
     return []
@@ -726,6 +736,7 @@ export async function processMdRules({
       visitedDirs.add(resolvedRulesDir)
     }
 
+    const top = topRulesDir ?? rulesDir
     const result: MemoryFileInfo[] = []
     let entries: import('fs').Dirent[]
     try {
@@ -760,9 +771,17 @@ export async function processMdRules({
             includeExternal,
             conditionalRule,
             visitedDirs,
+            excludeFrom,
+            topRulesDir: top,
           })),
         )
       } else if (isFile && entry.name.endsWith('.md')) {
+        if (excludeFrom) {
+          const rel = relative(resolve(top), resolve(resolvedEntryPath))
+          if (excludeFrom.has(rel)) {
+            continue
+          }
+        }
         const files = await processMemoryFile(
           resolvedEntryPath,
           type,
@@ -785,6 +804,89 @@ export async function processMdRules({
     }
     return []
   }
+}
+
+/**
+ * Returns the .agents and .claude variants of `<dir>/<subdir>`, in
+ * precedence order (.agents first).
+ */
+function rootPairDirs(dir: string, subdir: string): [agentsDir: string, claudeDir: string] {
+  const [agentsRoot, claudeRoot] = CONFIG_ROOT_NAMES
+  return [join(dir, agentsRoot, subdir), join(dir, claudeRoot, subdir)]
+}
+
+/**
+ * Processes a .agents/rules + .claude/rules directory pair. The .agents
+ * twin loads first and wins: .claude files with the same relative path
+ * are skipped.
+ */
+export async function processRulesPair({
+  agentsDir,
+  claudeDir,
+  type,
+  processedPaths,
+  includeExternal,
+  conditionalRule,
+}: {
+  agentsDir: string
+  claudeDir: string
+  type: MemoryType
+  processedPaths: Set<string>
+  includeExternal: boolean
+  conditionalRule: boolean
+}): Promise<MemoryFileInfo[]> {
+  const agentsFiles = await processMdRules({
+    rulesDir: agentsDir,
+    type,
+    processedPaths,
+    includeExternal,
+    conditionalRule,
+  })
+  const claimed = new Set(
+    agentsFiles.map(f => relative(resolve(agentsDir), resolve(f.path))),
+  )
+  const claudeFiles = await processMdRules({
+    rulesDir: claudeDir,
+    type,
+    processedPaths,
+    includeExternal,
+    conditionalRule,
+    excludeFrom: claimed,
+  })
+  return [...agentsFiles, ...claudeFiles]
+}
+
+/**
+ * Conditional variant of processRulesPair: same .agents-wins exclusion,
+ * then keeps only files whose frontmatter globs match the target path.
+ */
+export async function processConditionedRulesPair(
+  targetPath: string,
+  agentsDir: string,
+  claudeDir: string,
+  type: MemoryType,
+  processedPaths: Set<string>,
+  includeExternal: boolean,
+): Promise<MemoryFileInfo[]> {
+  const agentsFiles = await processConditionedMdRules(
+    targetPath,
+    agentsDir,
+    type,
+    processedPaths,
+    includeExternal,
+  )
+  const claimed = new Set(
+    agentsFiles.map(f => relative(resolve(agentsDir), resolve(f.path))),
+  )
+  const claudeFiles = await processConditionedMdRules(
+    targetPath,
+    claudeDir,
+    type,
+    processedPaths,
+    includeExternal,
+    claimed,
+  )
+  return [...agentsFiles, ...claudeFiles]
 }
 
 export const getMemoryFiles = memoize(
@@ -833,11 +935,11 @@ export const getMemoryFiles = memoize(
           true, // User memory can always include external files
         )),
       )
-      // Process User ~/.claude/rules/*.md files
-      const userClaudeRulesDir = getUserClaudeRulesDir()
+      // Process User rules (*.md files), .agents first so it wins ties
       result.push(
-        ...(await processMdRules({
-          rulesDir: userClaudeRulesDir,
+        ...(await processRulesPair({
+          agentsDir: getUserAgentsRulesDir(),
+          claudeDir: getUserClaudeRulesDir(),
           type: 'User',
           processedPaths,
           includeExternal: true,
@@ -906,11 +1008,12 @@ export const getMemoryFiles = memoize(
           )),
         )
 
-        // Try reading .claude/rules/*.md files (Project)
-        const rulesDir = join(dir, '.claude', 'rules')
+        // Try reading rules/*.md files (Project), .agents first
+        const [agentsRulesDir, claudeRulesDir] = rootPairDirs(dir, 'rules')
         result.push(
-          ...(await processMdRules({
-            rulesDir,
+          ...(await processRulesPair({
+            agentsDir: agentsRulesDir,
+            claudeDir: claudeRulesDir,
             type: 'Project',
             processedPaths,
             includeExternal,
@@ -962,11 +1065,12 @@ export const getMemoryFiles = memoize(
           )),
         )
 
-        // Try reading .claude/rules/*.md files from the additional directory
-        const rulesDir = join(dir, '.claude', 'rules')
+        // Try reading rules/*.md files from the additional directory, .agents first
+        const [additionalAgentsRulesDir, additionalClaudeRulesDir] = rootPairDirs(dir, 'rules')
         result.push(
-          ...(await processMdRules({
-            rulesDir,
+          ...(await processRulesPair({
+            agentsDir: additionalAgentsRulesDir,
+            claudeDir: additionalClaudeRulesDir,
             type: 'Project',
             processedPaths,
             includeExternal,
@@ -1221,12 +1325,12 @@ export async function getManagedAndUserConditionalRules(
   )
 
   if (isSettingSourceEnabled('userSettings')) {
-    // Process User conditional .claude/rules/*.md files
-    const userClaudeRulesDir = getUserClaudeRulesDir()
+    // Process User conditional rules (*.md files), .agents first
     result.push(
-      ...(await processConditionedMdRules(
+      ...(await processConditionedRulesPair(
         targetPath,
-        userClaudeRulesDir,
+        getUserAgentsRulesDir(),
+        getUserClaudeRulesDir(),
         'User',
         processedPaths,
         true,
@@ -1283,14 +1387,15 @@ export async function getMemoryFilesForNestedDirectory(
     )
   }
 
-  const rulesDir = join(dir, '.claude', 'rules')
+  const [nestedAgentsRulesDir, nestedClaudeRulesDir] = rootPairDirs(dir, 'rules')
 
-  // Process project unconditional .claude/rules/*.md files, which were not eagerly loaded
+  // Process project unconditional rules/*.md files, which were not eagerly loaded
   // Use a separate processedPaths set to avoid marking conditional rule files as processed
   const unconditionalProcessedPaths = new Set(processedPaths)
   result.push(
-    ...(await processMdRules({
-      rulesDir,
+    ...(await processRulesPair({
+      agentsDir: nestedAgentsRulesDir,
+      claudeDir: nestedClaudeRulesDir,
       type: 'Project',
       processedPaths: unconditionalProcessedPaths,
       includeExternal: false,
@@ -1298,11 +1403,12 @@ export async function getMemoryFilesForNestedDirectory(
     })),
   )
 
-  // Process project conditional .claude/rules/*.md files
+  // Process project conditional rules/*.md files
   result.push(
-    ...(await processConditionedMdRules(
+    ...(await processConditionedRulesPair(
       targetPath,
-      rulesDir,
+      nestedAgentsRulesDir,
+      nestedClaudeRulesDir,
       'Project',
       processedPaths,
       false,
@@ -1331,10 +1437,11 @@ export async function getConditionalRulesForCwdLevelDirectory(
   targetPath: string,
   processedPaths: Set<string>,
 ): Promise<MemoryFileInfo[]> {
-  const rulesDir = join(dir, '.claude', 'rules')
-  return processConditionedMdRules(
+  const [cwdAgentsRulesDir, cwdClaudeRulesDir] = rootPairDirs(dir, 'rules')
+  return processConditionedRulesPair(
     targetPath,
-    rulesDir,
+    cwdAgentsRulesDir,
+    cwdClaudeRulesDir,
     'Project',
     processedPaths,
     false,
@@ -1357,6 +1464,7 @@ export async function processConditionedMdRules(
   type: MemoryType,
   processedPaths: Set<string>,
   includeExternal: boolean,
+  excludeFrom?: Set<string>,
 ): Promise<MemoryFileInfo[]> {
   const conditionedRuleMdFiles = await processMdRules({
     rulesDir,
@@ -1364,6 +1472,7 @@ export async function processConditionedMdRules(
     processedPaths,
     includeExternal,
     conditionalRule: true,
+    excludeFrom,
   })
 
   // Filter to only include files whose globs patterns match the targetPath

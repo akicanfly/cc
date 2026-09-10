@@ -1,14 +1,32 @@
 import { afterAll, describe, expect, test } from 'bun:test'
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { tmpdir, homedir } from 'node:os'
 import { join } from 'node:path'
-import envPaths from 'env-paths'
 
 const originalCacheHome = process.env.XDG_CACHE_HOME
 const cacheRoot = await mkdtemp(join(tmpdir(), 'cc-models-cache-test-'))
 process.env.XDG_CACHE_HOME = cacheRoot
 
-const cacheDir = envPaths('cc').cache
+// Expected cache dir computed straight from the environment. Do NOT use
+// envPaths() here: it captures the process.env object identity at import
+// time, so any suite that replaces process.env (a common test pattern)
+// or imports env-paths early makes it read stale values.
+function expectedCacheDir(): string {
+  if (process.platform === 'darwin') {
+    return join(homedir(), 'Library', 'Caches', 'cc-nodejs')
+  }
+  if (process.platform === 'win32') {
+    const localAppData =
+      process.env.LOCALAPPDATA ?? join(homedir(), 'AppData', 'Local')
+    return join(localAppData, 'cc-nodejs', 'Cache')
+  }
+  return join(
+    process.env.XDG_CACHE_HOME ?? join(homedir(), '.cache'),
+    'cc-nodejs',
+  )
+}
+
+const cacheDir = expectedCacheDir()
 await mkdir(cacheDir, { recursive: true })
 await writeFile(
   join(cacheDir, 'models-dev-catalog.json'),

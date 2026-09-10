@@ -17,6 +17,7 @@ import {
 import { resetSentSkillNames } from '../attachments.js'
 import { registerCleanup } from '../cleanupRegistry.js'
 import { logForDebugging } from '../debug.js'
+import { getAgentsConfigHomeDir } from '../envUtils.js'
 import { getFsImplementation } from '../fsOperations.js'
 import { executeConfigChangeHooks, hasBlockingResult } from '../hooks.js'
 import { createSignal } from '../signal.js'
@@ -172,63 +173,54 @@ async function getWatchablePaths(): Promise<string[]> {
   const fs = getFsImplementation()
   const paths: string[] = []
 
-  // User skills directory (~/.claude/skills)
+  async function watchIfExists(dir: string, absolute = false): Promise<void> {
+    try {
+      const target = absolute ? platformPath.resolve(dir) : dir
+      await fs.stat(target)
+      paths.push(target)
+    } catch {
+      // Path doesn't exist, skip it
+    }
+  }
+
+  // User skills directories (~/.agents/skills wins, ~/.claude/skills fallback)
   const userSkillsPath = getSkillsPath('userSettings', 'skills')
   if (userSkillsPath) {
-    try {
-      await fs.stat(userSkillsPath)
-      paths.push(userSkillsPath)
-    } catch {
-      // Path doesn't exist, skip it
-    }
+    await watchIfExists(
+      platformPath.join(getAgentsConfigHomeDir(), 'skills'),
+    )
+    await watchIfExists(userSkillsPath)
   }
 
-  // User commands directory (~/.claude/commands)
+  // User commands directories
   const userCommandsPath = getSkillsPath('userSettings', 'commands')
   if (userCommandsPath) {
-    try {
-      await fs.stat(userCommandsPath)
-      paths.push(userCommandsPath)
-    } catch {
-      // Path doesn't exist, skip it
-    }
+    await watchIfExists(
+      platformPath.join(getAgentsConfigHomeDir(), 'commands'),
+    )
+    await watchIfExists(userCommandsPath)
   }
 
-  // Project skills directory (.claude/skills)
+  // Project skills directories (.agents/skills wins, .claude/skills fallback)
   const projectSkillsPath = getSkillsPath('projectSettings', 'skills')
   if (projectSkillsPath) {
-    try {
-      // For project settings, resolve to absolute path
-      const absolutePath = platformPath.resolve(projectSkillsPath)
-      await fs.stat(absolutePath)
-      paths.push(absolutePath)
-    } catch {
-      // Path doesn't exist, skip it
-    }
+    // For project settings, resolve to absolute path
+    await watchIfExists('.agents/skills', true)
+    await watchIfExists(projectSkillsPath, true)
   }
 
-  // Project commands directory (.claude/commands)
+  // Project commands directories
   const projectCommandsPath = getSkillsPath('projectSettings', 'commands')
   if (projectCommandsPath) {
-    try {
-      // For project settings, resolve to absolute path
-      const absolutePath = platformPath.resolve(projectCommandsPath)
-      await fs.stat(absolutePath)
-      paths.push(absolutePath)
-    } catch {
-      // Path doesn't exist, skip it
-    }
+    // For project settings, resolve to absolute path
+    await watchIfExists('.agents/commands', true)
+    await watchIfExists(projectCommandsPath, true)
   }
 
   // Additional directories (--add-dir) skills
   for (const dir of getAdditionalDirectoriesForClaudeMd()) {
-    const additionalSkillsPath = platformPath.join(dir, '.claude', 'skills')
-    try {
-      await fs.stat(additionalSkillsPath)
-      paths.push(additionalSkillsPath)
-    } catch {
-      // Path doesn't exist, skip it
-    }
+    await watchIfExists(platformPath.join(dir, '.agents', 'skills'))
+    await watchIfExists(platformPath.join(dir, '.claude', 'skills'))
   }
 
   return paths

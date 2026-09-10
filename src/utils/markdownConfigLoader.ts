@@ -3,14 +3,14 @@ import { statSync } from 'fs'
 import { lstat, readdir, readFile, realpath, stat } from 'fs/promises'
 import memoize from 'lodash-es/memoize.js'
 import { homedir } from 'os'
-import { dirname, join, resolve, sep } from 'path'
+import { dirname, basename, join, resolve, sep } from 'path'
 import {
   type AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
   logEvent,
 } from 'src/services/analytics/index.js'
 import { getProjectRoot } from '../bootstrap/state.js'
 import { logForDebugging } from './debug.js'
-import { getClaudeConfigHomeDir, isEnvTruthy } from './envUtils.js'
+import { getAgentsConfigHomeDir, getClaudeConfigHomeDir, isEnvTruthy } from './envUtils.js'
 import { isFsInaccessible } from './errors.js'
 import { normalizePathForComparison } from './file.js'
 import type { FrontmatterData } from './frontmatterParser.js'
@@ -24,6 +24,10 @@ import {
 } from './settings/constants.js'
 import { getManagedFilePath } from './settings/managedPath.js'
 import { isRestrictedToPluginOnly } from './settings/pluginOnlyPolicy.js'
+
+// Configuration root directory names, in precedence order. Entries from an
+// earlier root win over later ones when two files share a name.
+export const CONFIG_ROOT_NAMES = ['.agents', '.claude'] as const
 
 // Claude configuration directory names
 export const CLAUDE_CONFIG_DIRECTORIES = [
@@ -250,18 +254,21 @@ export function getProjectDirsUpToHome(
       break
     }
 
-    const claudeSubdir = join(current, '.claude', subdir)
+    const claudeSubdirs = CONFIG_ROOT_NAMES.map(root => join(current, root, subdir))
     // Filter to existing dirs. This is a perf filter (avoids spawning
     // ripgrep on non-existent dirs downstream) and the worktree fallback
     // in loadMarkdownFilesForSubdir relies on it. statSync + explicit error
     // handling instead of existsSync — re-throws unexpected errors rather
     // than silently swallowing them. Downstream loadMarkdownFiles handles
     // the TOCTOU window (dir disappearing before read) gracefully.
-    try {
-      statSync(claudeSubdir)
-      dirs.push(claudeSubdir)
-    } catch (e: unknown) {
-      if (!isFsInaccessible(e)) throw e
+    // Roots are pushed .agents-first so .agents entries win name collisions.
+    for (const claudeSubdir of claudeSubdirs) {
+      try {
+        statSync(claudeSubdir)
+        dirs.push(claudeSubdir)
+      } catch (e: unknown) {
+        if (!isFsInaccessible(e)) throw e
+      }
     }
 
     // Stop after processing the git root directory - this prevents commands from parent
@@ -300,18 +307,22 @@ export const loadMarkdownFilesForSubdir = memoize(
     cwd: string,
   ): Promise<MarkdownFile[]> {
     const searchStartTime = Date.now()
-    const userDir = join(getClaudeConfigHomeDir(), subdir)
+    // .agents home first so it wins name collisions with the .claude home.
+    const userDirs = [
+      join(getAgentsConfigHomeDir(), subdir),
+      join(getClaudeConfigHomeDir(), subdir),
+    ]
     const managedDir = join(getManagedFilePath(), '.claude', subdir)
     const projectDirs = getProjectDirsUpToHome(subdir, cwd)
 
-    // For git worktrees where the worktree does NOT have .claude/<subdir> checked
+    // For git worktrees where the worktree does NOT have <root>/<subdir> checked
     // out (e.g. sparse-checkout), fall back to the main repository's copy.
     // getProjectDirsUpToHome stops at the worktree root (where the .git file is),
     // so it never sees the main repo on its own.
     //
-    // Only add the main repo's copy when the worktree root's .claude/<subdir>
+    // Only add the main repo's copy when the worktree root's <root>/<subdir>
     // is absent. A standard `git worktree add` checks out the full tree, so the
-    // worktree already has identical .claude/<subdir> content — loading the main
+    // worktree already has identical <root>/<subdir> content — loading the main
     // repo's copy too would duplicate every command/agent/skill
     // (anthropics/claude-code#29599, #28182, #26992).
     //
@@ -320,21 +331,23 @@ export const loadMarkdownFilesForSubdir = memoize(
     const gitRoot = findGitRoot(cwd)
     const canonicalRoot = findCanonicalGitRoot(cwd)
     if (gitRoot && canonicalRoot && canonicalRoot !== gitRoot) {
-      const worktreeSubdir = normalizePathForComparison(
-        join(gitRoot, '.claude', subdir),
-      )
-      const worktreeHasSubdir = projectDirs.some(
-        dir => normalizePathForComparison(dir) === worktreeSubdir,
-      )
-      if (!worktreeHasSubdir) {
-        const mainClaudeSubdir = join(canonicalRoot, '.claude', subdir)
-        if (!projectDirs.includes(mainClaudeSubdir)) {
-          projectDirs.push(mainClaudeSubdir)
+      for (const root of CONFIG_ROOT_NAMES) {
+        const worktreeSubdir = normalizePathForComparison(
+          join(gitRoot, root, subdir),
+        )
+        const worktreeHasSubdir = projectDirs.some(
+          dir => normalizePathForComparison(dir) === worktreeSubdir,
+        )
+        if (!worktreeHasSubdir) {
+          const mainClaudeSubdir = join(canonicalRoot, root, subdir)
+          if (!projectDirs.includes(mainClaudeSubdir)) {
+            projectDirs.push(mainClaudeSubdir)
+          }
         }
       }
     }
 
-    const [managedFiles, userFiles, projectFilesNested] = await Promise.all([
+    const [managedFiles, userFilesNested, projectFilesNested] = await Promise.all([
       // Always load managed (policy settings)
       loadMarkdownFiles(managedDir).then(_ =>
         _.map(file => ({
@@ -346,12 +359,16 @@ export const loadMarkdownFilesForSubdir = memoize(
       // Conditionally load user files
       isSettingSourceEnabled('userSettings') &&
       !(subdir === 'agents' && isRestrictedToPluginOnly('agents'))
-        ? loadMarkdownFiles(userDir).then(_ =>
-            _.map(file => ({
-              ...file,
-              baseDir: userDir,
-              source: 'userSettings' as const,
-            })),
+        ? Promise.all(
+            userDirs.map(userDir =>
+              loadMarkdownFiles(userDir).then(_ =>
+                _.map(file => ({
+                  ...file,
+                  baseDir: userDir,
+                  source: 'userSettings' as const,
+                })),
+              ),
+            ),
           )
         : Promise.resolve([]),
       // Conditionally load project files from all directories up to home
@@ -371,10 +388,12 @@ export const loadMarkdownFilesForSubdir = memoize(
         : Promise.resolve([]),
     ])
 
-    // Flatten nested project files array
+    // Flatten nested user and project files arrays
+    const userFiles = userFilesNested.flat()
     const projectFiles = projectFilesNested.flat()
 
-    // Combine all files with priority: managed > user > project
+    // Combine all files with priority: managed > user > project.
+    // Within one tier, .agents entries come before .claude entries.
     const allFiles = [...managedFiles, ...userFiles, ...projectFiles]
 
     // Deduplicate files that resolve to the same physical file (same inode).
@@ -413,6 +432,30 @@ export const loadMarkdownFilesForSubdir = memoize(
       )
     }
 
+    // First wins by display name: managed > user > project, and .agents
+    // before .claude within one tier. This implements the priority the
+    // combine order promises — previously two files sharing a name both
+    // loaded and fought downstream.
+    const seenNames = new Set<string>()
+    const namedFiles = deduplicatedFiles.filter(file => {
+      const key = displayNameOf(file).toLowerCase()
+      if (seenNames.has(key)) {
+        logForDebugging(
+          `Skipping duplicate '${displayNameOf(file)}' in ${subdir} from ${file.source} (${file.filePath})`,
+        )
+        return false
+      }
+      seenNames.add(key)
+      return true
+    })
+
+    const namesRemoved = deduplicatedFiles.length - namedFiles.length
+    if (namesRemoved > 0) {
+      logForDebugging(
+        `Deduplicated ${namesRemoved} files in ${subdir} (same name, lower priority source)`,
+      )
+    }
+
     logEvent(`tengu_dir_search`, {
       durationMs: Date.now() - searchStartTime,
       managedFilesFound: managedFiles.length,
@@ -423,11 +466,17 @@ export const loadMarkdownFilesForSubdir = memoize(
         subdir as AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS,
     })
 
-    return deduplicatedFiles
+    return namedFiles
   },
   // Custom resolver creates cache key from both subdir and cwd parameters
   (subdir: ClaudeConfigDirectory, cwd: string) => `${subdir}:${cwd}`,
 )
+
+function displayNameOf(file: { filePath: string; frontmatter: FrontmatterData }): string {
+  const override = (file.frontmatter as Record<string, unknown> | undefined)?.name
+  if (typeof override === 'string' && override.trim()) return override.trim()
+  return basename(file.filePath, '.md')
+}
 
 /**
  * Native implementation to find markdown files using Node.js fs APIs

@@ -30,6 +30,7 @@ import {
   parseEffortValue,
 } from '../utils/effort.js'
 import {
+  getAgentsConfigHomeDir,
   getClaudeConfigHomeDir,
   isBareMode,
   isEnvTruthy,
@@ -48,6 +49,7 @@ import { getFsImplementation } from '../utils/fsOperations.js'
 import { isPathGitignored } from '../utils/git/gitignore.js'
 import { logError } from '../utils/log.js'
 import {
+  CONFIG_ROOT_NAMES,
   extractDescriptionFromMarkdown,
   getProjectDirsUpToHome,
   loadMarkdownFilesForSubdir,
@@ -90,6 +92,29 @@ export function getSkillsPath(
       return 'plugin'
     default:
       return ''
+  }
+}
+
+/**
+ * Returns every on-disk directory consulted for a given source, .agents
+ * first. Policy and plugin sources only have the one .claude path.
+ */
+export function getSkillsDirPaths(
+  source: SettingSource | 'plugin',
+  dir: 'skills' | 'commands',
+): string[] {
+  switch (source) {
+    case 'userSettings':
+      return [
+        join(getAgentsConfigHomeDir(), dir),
+        join(getClaudeConfigHomeDir(), dir),
+      ]
+    case 'projectSettings':
+      return [`.agents/${dir}`, `.claude/${dir}`]
+    default: {
+      const single = getSkillsPath(source, dir)
+      return single ? [single] : []
+    }
   }
 }
 
@@ -637,12 +662,15 @@ async function loadSkillsFromCommandsDir(
  */
 export const getSkillDirCommands = memoize(
   async (cwd: string): Promise<Command[]> => {
-    const userSkillsDir = join(getClaudeConfigHomeDir(), 'skills')
+    const userSkillsDirs = [
+      join(getAgentsConfigHomeDir(), 'skills'),
+      join(getClaudeConfigHomeDir(), 'skills'),
+    ]
     const managedSkillsDir = join(getManagedFilePath(), '.claude', 'skills')
     const projectSkillsDirs = getProjectDirsUpToHome('skills', cwd)
 
     logForDebugging(
-      `Loading skills from: managed=${managedSkillsDir}, user=${userSkillsDir}, project=[${projectSkillsDirs.join(', ')}]`,
+      `Loading skills from: managed=${managedSkillsDir}, user=[${userSkillsDirs.join(', ')}], project=[${projectSkillsDirs.join(', ')}]`,
     )
 
     // Load from additional directories (--add-dir)
@@ -663,10 +691,12 @@ export const getSkillDirCommands = memoize(
         return []
       }
       const additionalSkillsNested = await Promise.all(
-        additionalDirs.map(dir =>
-          loadSkillsFromSkillsDir(
-            join(dir, '.claude', 'skills'),
-            'projectSettings',
+        additionalDirs.flatMap(dir =>
+          CONFIG_ROOT_NAMES.map(root =>
+            loadSkillsFromSkillsDir(
+              join(dir, root, 'skills'),
+              'projectSettings',
+            ),
           ),
         ),
       )
@@ -687,7 +717,11 @@ export const getSkillDirCommands = memoize(
         ? Promise.resolve([])
         : loadSkillsFromSkillsDir(managedSkillsDir, 'policySettings'),
       isSettingSourceEnabled('userSettings') && !skillsLocked
-        ? loadSkillsFromSkillsDir(userSkillsDir, 'userSettings')
+        ? Promise.all(
+            userSkillsDirs.map(dir =>
+              loadSkillsFromSkillsDir(dir, 'userSettings'),
+            ),
+          ).then(nested => nested.flat())
         : Promise.resolve([]),
       projectSettingsEnabled
         ? Promise.all(
@@ -698,10 +732,12 @@ export const getSkillDirCommands = memoize(
         : Promise.resolve([]),
       projectSettingsEnabled
         ? Promise.all(
-            additionalDirs.map(dir =>
-              loadSkillsFromSkillsDir(
-                join(dir, '.claude', 'skills'),
-                'projectSettings',
+            additionalDirs.flatMap(dir =>
+              CONFIG_ROOT_NAMES.map(root =>
+                loadSkillsFromSkillsDir(
+                  join(dir, root, 'skills'),
+                  'projectSettings',
+                ),
               ),
             ),
           )
@@ -768,10 +804,26 @@ export const getSkillDirCommands = memoize(
       logForDebugging(`Deduplicated ${duplicatesRemoved} skills (same file)`)
     }
 
+    // First wins by skill name: managed > user > project, and .agents
+    // before .claude within one tier. Previously two files sharing a name
+    // both loaded and fought downstream.
+    const seenNames = new Set<string>()
+    const namedSkills = deduplicatedSkills.filter(skill => {
+      const key = skill.name.toLowerCase()
+      if (seenNames.has(key)) {
+        logForDebugging(
+          `Skipping duplicate skill '${skill.name}' from ${skill.source} (lower priority source)`,
+        )
+        return false
+      }
+      seenNames.add(key)
+      return true
+    })
+
     // Separate conditional skills (with paths frontmatter) from unconditional ones
     const unconditionalSkills: Command[] = []
     const newConditionalSkills: Command[] = []
-    for (const skill of deduplicatedSkills) {
+    for (const skill of namedSkills) {
       if (
         skill.type === 'prompt' &&
         skill.paths &&
@@ -796,7 +848,7 @@ export const getSkillDirCommands = memoize(
     }
 
     logForDebugging(
-      `Loaded ${deduplicatedSkills.length} unique skills (${unconditionalSkills.length} unconditional, ${newConditionalSkills.length} conditional, managed: ${managedSkills.length}, user: ${userSkills.length}, project: ${projectSkillsNested.flat().length}, additional: ${additionalSkillsNested.flat().length}, legacy commands: ${legacyCommands.length})`,
+      `Loaded ${namedSkills.length} unique skills (${unconditionalSkills.length} unconditional, ${newConditionalSkills.length} conditional, managed: ${managedSkills.length}, user: ${userSkills.length}, project: ${projectSkillsNested.flat().length}, additional: ${additionalSkillsNested.flat().length}, legacy commands: ${legacyCommands.length})`,
     )
 
     return unconditionalSkills
@@ -874,30 +926,35 @@ export async function discoverSkillDirsForPaths(
     // CWD-level skills are already loaded at startup, so we only discover nested ones
     // Use prefix+separator check to avoid matching /project-backup when cwd is /project
     while (currentDir.startsWith(resolvedCwd + pathSep)) {
-      const skillDir = join(currentDir, '.claude', 'skills')
+      // .agents first so it wins name collisions with .claude.
+      const skillDirs = CONFIG_ROOT_NAMES.map(root =>
+        join(currentDir, root, 'skills'),
+      )
 
       // Skip if we've already checked this path (hit or miss) — avoids
       // repeating the same failed stat on every Read/Write/Edit call when
       // the directory doesn't exist (the common case).
-      if (!dynamicSkillDirs.has(skillDir)) {
-        dynamicSkillDirs.add(skillDir)
-        try {
-          await fs.stat(skillDir)
-          // Skills dir exists. Before loading, check if the containing dir
-          // is gitignored — blocks e.g. node_modules/pkg/.claude/skills from
-          // loading silently. `git check-ignore` handles nested .gitignore,
-          // .git/info/exclude, and global gitignore. Fails open outside a
-          // git repo (exit 128 → false); the invocation-time trust dialog
-          // is the actual security boundary.
-          if (await isPathGitignored(currentDir, resolvedCwd)) {
-            logForDebugging(
-              `[skills] Skipped gitignored skills dir: ${skillDir}`,
-            )
-            continue
+      for (const skillDir of skillDirs) {
+        if (!dynamicSkillDirs.has(skillDir)) {
+          dynamicSkillDirs.add(skillDir)
+          try {
+            await fs.stat(skillDir)
+            // Skills dir exists. Before loading, check if the containing dir
+            // is gitignored — blocks e.g. node_modules/pkg/.claude/skills from
+            // loading silently. `git check-ignore` handles nested .gitignore,
+            // .git/info/exclude, and global gitignore. Fails open outside a
+            // git repo (exit 128 → false); the invocation-time trust dialog
+            // is the actual security boundary.
+            if (await isPathGitignored(currentDir, resolvedCwd)) {
+              logForDebugging(
+                `[skills] Skipped gitignored skills dir: ${skillDir}`,
+              )
+              continue
+            }
+            newDirs.push(skillDir)
+          } catch {
+            // Directory doesn't exist — already recorded above, continue
           }
-          newDirs.push(skillDir)
-        } catch {
-          // Directory doesn't exist — already recorded above, continue
         }
       }
 

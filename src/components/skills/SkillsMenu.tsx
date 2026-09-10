@@ -4,7 +4,7 @@ import * as React from 'react';
 import { useMemo } from 'react';
 import { type Command, type CommandBase, type CommandResultDisplay, getCommandName, type PromptCommand } from '../../commands.js';
 import { Box, Text } from '../../ink.js';
-import { estimateSkillFrontmatterTokens, getSkillsPath } from '../../skills/loadSkillsDir.js';
+import { estimateSkillFrontmatterTokens, getSkillsDirPaths } from '../../skills/loadSkillsDir.js';
 import { getDisplayPath } from '../../utils/file.js';
 import { formatTokens } from '../../utils/format.js';
 import { getSettingSourceName, type SettingSource } from '../../utils/settings/constants.js';
@@ -40,9 +40,10 @@ function getSourceSubtitle(source: SkillSource, skills: SkillCommand[]): string 
     }).filter((n): n is string => n != null))];
     return servers.length > 0 ? servers.join(', ') : undefined;
   }
-  const skillsPath = getDisplayPath(getSkillsPath(source, 'skills'));
+  const skillsPaths = getSkillsDirPaths(source, 'skills').map(p => getDisplayPath(p)).join(', ');
   const hasCommandsSkills = skills.some(s => s.loadedFrom === 'commands_DEPRECATED');
-  return hasCommandsSkills ? `${skillsPath}, ${getDisplayPath(getSkillsPath(source, 'commands'))}` : skillsPath;
+  const commandsPaths = getSkillsDirPaths(source, 'commands').map(p => getDisplayPath(p)).join(', ');
+  return hasCommandsSkills ? `${skillsPaths}, ${commandsPaths}` : skillsPaths;
 }
 export function SkillsMenu(t0) {
   const $ = _c(35);
@@ -101,7 +102,7 @@ export function SkillsMenu(t0) {
   if (skills.length === 0) {
     let t3;
     if ($[6] === Symbol.for("react.memo_cache_sentinel")) {
-      t3 = <Text dimColor={true}>Create skills in .claude/skills/ or ~/.claude/skills/</Text>;
+      t3 = <Text dimColor={true}>Create skills in .agents/skills/, .claude/skills/, or ~/.agents/skills/</Text>;
       $[6] = t3;
     } else {
       t3 = $[6];

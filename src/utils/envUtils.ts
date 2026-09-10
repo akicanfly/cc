@@ -1,6 +1,6 @@
 import memoize from 'lodash-es/memoize.js'
 import { homedir } from 'os'
-import { join } from 'path'
+import { basename, dirname, join } from 'path'
 
 // Memoized: 150+ callers, many on hot paths. Keyed off CLAUDE_CONFIG_DIR so
 // tests that change the env var get a fresh value without explicit cache.clear.
@@ -9,6 +9,20 @@ export const getClaudeConfigHomeDir = memoize(
     return (
       process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude')
     ).normalize('NFC')
+  },
+  () => process.env.CLAUDE_CONFIG_DIR,
+)
+
+// Sibling home for .agents/ config roots. Normally ~/.agents. Under a
+// CLAUDE_CONFIG_DIR override it nests inside the override so tests and
+// custom layouts never leak into the real home directory.
+export const getAgentsConfigHomeDir = memoize(
+  (): string => {
+    const claudeHome = getClaudeConfigHomeDir()
+    if (basename(claudeHome) === '.claude') {
+      return join(dirname(claudeHome), '.agents').normalize('NFC')
+    }
+    return join(claudeHome, '.agents').normalize('NFC')
   },
   () => process.env.CLAUDE_CONFIG_DIR,
 )

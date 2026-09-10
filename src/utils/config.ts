@@ -17,7 +17,7 @@ import { registerCleanup } from './cleanupRegistry.js'
 import { logForDebugging } from './debug.js'
 import { logForDiagnosticsNoPII } from './diagLogs.js'
 import { getGlobalClaudeFile } from './env.js'
-import { getClaudeConfigHomeDir, isEnvTruthy } from './envUtils.js'
+import { getAgentsConfigHomeDir, getClaudeConfigHomeDir, isEnvTruthy } from './envUtils.js'
 import { ConfigParseError, getErrnoCode } from './errors.js'
 import { writeFileSyncAndFlush_DEPRECATED } from './file.js'
 import { getFsImplementation } from './fsOperations.js'
@@ -1804,6 +1804,10 @@ export function getManagedClaudeRulesDir(): string {
 
 export function getUserClaudeRulesDir(): string {
   return join(getClaudeConfigHomeDir(), 'rules')
+}
+
+export function getUserAgentsRulesDir(): string {
+  return join(getAgentsConfigHomeDir(), 'rules')
 }
 
 // Exported for testing only
