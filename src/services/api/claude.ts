@@ -1599,22 +1599,6 @@ async function* queryModel(
       }
     }
 
-    // Forward the user's effort choice into output_config.effort when the
-    // OpenAI-compatible provider is active. The OAI shim (openaiCompatible.ts)
-    // reads output_config.effort and translates it to reasoning_effort via
-    // the variant-blob table. For the first-party Anthropic path, effort
-    // already flows through lowerThinking's thinking param at line 1623, and
-    // the SDK already sends output_config.effort to the API when present
-    // (BetaOutputConfig is part of the schema). Gating on the env var keeps
-    // the first-party request shape unchanged.
-    if (
-      typeof effort === 'string' &&
-      !('effort' in outputConfig) &&
-      isOpenAICompatibleConfigured()
-    ) {
-      outputConfig.effort = effort as BetaOutputConfig['effort']
-    }
-
     // Retry context gets preference because it tries to course correct if we exceed the context window limit
     const maxOutputTokens =
       retryContext?.maxTokensOverride ||
@@ -2490,6 +2474,7 @@ async function* queryModel(
       // starts a tool, then the non-streaming retry produces the same tool_use
       // and runs it again. See inc-4258.
       const disableFallback =
+        isOpenAICompatibleConfigured() ||
         isEnvTruthy(process.env.CLAUDE_CODE_DISABLE_NONSTREAMING_FALLBACK) ||
         getFeatureValue_CACHED_MAY_BE_STALE(
           'tengu_disable_streaming_to_non_streaming_fallback',

@@ -6,6 +6,7 @@ export type OpenAIErrorPayload = {
     type?: unknown
     code?: unknown
     param?: unknown
+    upstream?: { message?: unknown }
   }
 }
 
@@ -24,6 +25,7 @@ export async function createOpenAICompatibleResponseError(
     rawBody,
   )
   const headers = new Headers(response.headers)
+  headers.set('x-ccc-provider-error', 'true')
   const requestId = headers.get('x-request-id')
   if (requestId && !headers.has('request-id')) headers.set('request-id', requestId)
 
@@ -31,6 +33,7 @@ export async function createOpenAICompatibleResponseError(
     response.status,
     {
       error: {
+        ...providerError,
         message,
         type: asString(providerError?.type),
         code: asString(providerError?.code),
@@ -52,7 +55,46 @@ export function createOpenAICompatibleStreamError(
     payload.error,
     stringifyJson(payload),
   )
-  return APIError.generate(undefined, payload, message, undefined)
+  return APIError.generate(payloadErrorStatus(payload.error), payload, message, new Headers({ 'x-ccc-provider-error': 'true' }))
+}
+
+export function createOpenAICompatiblePayloadError(
+  payload: Record<string, unknown>, headers: Headers, operation = 'provider response',
+): APIError {
+  const base = payload.base_resp as { status_code?: unknown; status_msg?: unknown } | undefined
+  const raw = payload.error
+  const error = raw && typeof raw === 'object' ? raw as Record<string, unknown>
+    : { message: typeof raw === 'string' ? raw : base?.status_msg, code: base?.status_code }
+  const status = payloadErrorStatus(error)
+  const message = formatMessage(operation, status, undefined, error, stringifyJson(payload))
+  const normalizedHeaders = new Headers(headers)
+  normalizedHeaders.set('x-ccc-provider-error', 'true')
+  if (!normalizedHeaders.has('request-id') && normalizedHeaders.has('x-request-id')) normalizedHeaders.set('request-id', normalizedHeaders.get('x-request-id')!)
+  return APIError.generate(status, { error: { ...error, message } }, message, normalizedHeaders)
+}
+
+function payloadErrorStatus(error: Record<string, unknown> | undefined): number {
+  for (const value of [error?.status, error?.status_code, error?.code]) {
+    if (typeof value === 'number' && Number.isInteger(value) && value >= 400 && value <= 599) return value
+  }
+  const statuses: Record<string, number> = {
+    authentication_error: 401, invalid_api_key: 401, invalid_authentication: 401, unauthenticated: 401,
+    permission_error: 403, permission_denied: 403, access_denied: 403,
+    not_found_error: 404, model_not_found: 404, not_found: 404,
+    rate_limit_error: 429, rate_limit_exceeded: 429, insufficient_quota: 429, resource_exhausted: 429,
+    insufficient_balance: 402, insufficient_credits: 402, payment_required: 402,
+    invalid_request_error: 400, invalid_argument: 400, context_length_exceeded: 400,
+    overloaded_error: 529, server_error: 500, internal_error: 500, internal: 500,
+    service_unavailable: 503, unavailable: 503, deadline_exceeded: 408,
+  }
+  for (const value of [error?.code, error?.type, error?.status]) {
+    if (typeof value === 'string' && statuses[value.toLowerCase()] !== undefined) return statuses[value.toLowerCase()]!
+  }
+  const message = asString(error?.message) ?? ''
+  if (/invalid (?:api[ -]?)?key|bad key|authentication failed|unauthorized/i.test(message)) return 401
+  if (/rate limit|too many requests|quota exceeded/i.test(message)) return 429
+  // An unknown error envelope is not evidence of a transient server failure.
+  return 400
 }
 
 export function isOpenAIErrorPayload(
@@ -69,7 +111,12 @@ export function isOpenAIErrorPayload(
 function parseOpenAIErrorPayload(rawBody: string): OpenAIErrorPayload | undefined {
   try {
     const parsed = JSON.parse(rawBody) as unknown
-    return isOpenAIErrorPayload(parsed) ? parsed : undefined
+    if (!parsed || typeof parsed !== 'object') return undefined
+    const value = parsed as Record<string, unknown>
+    if (typeof value.error === 'string') return { error: { message: value.error } }
+    if (isOpenAIErrorPayload(parsed)) return parsed
+    if (typeof value.message === 'string') return { error: { message: value.message } }
+    return undefined
   } catch {
     return undefined
   }
@@ -85,15 +132,24 @@ function formatMessage(
   const providerMessage = asString(error?.message)
   const fallback = truncate(rawBody.trim()) || statusText || 'Unknown provider error'
   const hint = errorHint(status, asString(error?.code), providerMessage ?? rawBody)
-  return `OpenAI-compatible ${operation} failed: ${providerMessage || fallback}${hint ? ` ${hint}` : ''}`
+  const param = asString(error?.param)
+  const upstream = upstreamMessage(error?.upstream?.message)
+  return `OpenAI-compatible ${operation} failed: ${providerMessage || fallback}${upstream ? ` Upstream: ${upstream}` : ''}${param ? ` Parameter: ${param}.` : ''}${hint ? ` ${hint}` : ''}`
+}
+
+function upstreamMessage(raw: unknown): string | undefined {
+  if (typeof raw !== 'string' || !raw.trim()) return
+  try {
+    const nested = JSON.parse(raw) as { error?: { message?: unknown }; message?: unknown }
+    return truncate(asString(nested?.error?.message) ?? asString(nested?.message) ?? raw)
+  } catch {
+    return truncate(raw)
+  }
 }
 
 function errorHint(status: number | undefined, code: string | undefined, body: string): string {
   if (body.includes('MissingSessionID')) {
     return 'The Zen free tier needs an x-opencode-session header. It is sent automatically; if you set OPENAI_COMPATIBLE_HEADERS manually, include x-opencode-session.'
-  }
-  if (status === 500 && body.includes('Internal server error')) {
-    return 'The free muse-spark model only works through POST /responses, which this client selects automatically. Check OPENAI_COMPATIBLE_USE_RESPONSES is not set to false.'
   }
   if (status === 401 || status === 403) {
     return 'Check the configured API key and provider permissions.'

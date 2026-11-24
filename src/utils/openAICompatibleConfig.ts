@@ -1,8 +1,9 @@
 import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'fs'
 import { join } from 'path'
+import { environmentProviderOptions, parseOpenAICompatibleOptions, type OpenAICompatibleProviderOptions } from './openAICompatibleOptions.js'
 import { getClaudeConfigHomeDir } from './envUtils.js'
 
-export type OpenAICompatibleConfig = {
+export type OpenAICompatibleConfig = OpenAICompatibleProviderOptions & {
   baseURL: string
   apiKey?: string
   headers: Record<string, string>
@@ -18,7 +19,7 @@ const DEFAULT_PROVIDER_PROFILE: OpenAICompatibleProviderProfile = {
 const configChangeListeners = new Set<() => void>()
 let configVersion = 0
 
-export type StoredOpenAICompatibleConfig = {
+export type StoredOpenAICompatibleConfig = OpenAICompatibleProviderOptions & {
   baseURL: string
   apiKey?: string
 }
@@ -96,7 +97,7 @@ export function getStoredOpenAICompatibleProfiles():
   // the versioned format the next time the user changes provider settings.
   if (typeof value.baseURL === 'string') {
     const profile = parseProfile(
-      { name: 'default', baseURL: value.baseURL, apiKey: value.apiKey },
+      { ...value, name: 'default' },
       configPath,
     )
     return { version: 1, activeProfile: profile.name, profiles: [profile] }
@@ -138,7 +139,8 @@ export function getStoredOpenAICompatibleConfig():
     profile => profile.name === stored.activeProfile,
   )
   if (!active) return
-  return { baseURL: active.baseURL, apiKey: active.apiKey }
+  const { name: _name, ...config } = active
+  return config
 }
 
 export function saveOpenAICompatibleProfiles(
@@ -196,13 +198,16 @@ export function getOpenAICompatibleConfig(): OpenAICompatibleConfig | undefined 
 
   const validatedBaseURL = validateBaseURL(baseURL)
 
+  const overrides = environmentProviderOptions(process.env)
+  const headers = new Headers(profileConfig?.headers)
+  for (const [name, value] of Object.entries(overrides.headers ?? {})) headers.set(name, value)
   return {
+    ...profileConfig,
+    ...overrides,
     baseURL: validatedBaseURL,
     apiKey,
-    headers: parseHeaders(process.env.OPENAI_COMPATIBLE_HEADERS),
-    timeoutMs: parseTimeout(
-      process.env.OPENAI_COMPATIBLE_TIMEOUT_MS || process.env.API_TIMEOUT_MS,
-    ),
+    headers: Object.fromEntries(headers.entries()),
+    timeoutMs: overrides.timeoutMs ?? profileConfig?.timeoutMs ?? DEFAULT_TIMEOUT_MS,
   }
 }
 
@@ -229,7 +234,8 @@ function getActiveProfileConfig(): StoredOpenAICompatibleConfig | undefined {
     profile => profile.name === profiles.activeProfile,
   )
   if (!active) return
-  return { baseURL: active.baseURL, apiKey: active.apiKey }
+  const { name: _name, ...config } = active
+  return config
 }
 
 function validateBaseURL(baseURL: string): string {
@@ -282,42 +288,11 @@ function parseProfile(
       `OpenAI-compatible config at ${configPath} has a profile with an invalid apiKey`,
     )
   }
+  const { name: _name, baseURL: _baseURL, apiKey: _apiKey, ...options } = profile
   return {
+    ...parseOpenAICompatibleOptions(options, true),
     name,
     baseURL: validateBaseURL(profile.baseURL),
     ...(profile.apiKey ? { apiKey: profile.apiKey } : {}),
   }
-}
-
-function parseTimeout(raw: string | undefined): number {
-  if (!raw) return DEFAULT_TIMEOUT_MS
-  const timeout = Number(raw)
-  if (!Number.isSafeInteger(timeout) || timeout <= 0) {
-    throw new Error('OPENAI_COMPATIBLE_TIMEOUT_MS must be a positive integer')
-  }
-  return timeout
-}
-
-function parseHeaders(raw: string | undefined): Record<string, string> {
-  if (!raw) return {}
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(raw)
-  } catch {
-    throw new Error(
-      'OPENAI_COMPATIBLE_HEADERS must be a valid JSON object with string values',
-    )
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error(
-      'OPENAI_COMPATIBLE_HEADERS must be a valid JSON object with string values',
-    )
-  }
-  const entries = Object.entries(parsed)
-  if (entries.some(([, value]) => typeof value !== 'string')) {
-    throw new Error(
-      'OPENAI_COMPATIBLE_HEADERS must be a valid JSON object with string values',
-    )
-  }
-  return Object.fromEntries(entries) as Record<string, string>
 }

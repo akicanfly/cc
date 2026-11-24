@@ -810,6 +810,16 @@ export function getAssistantMessageFromError(
     }
   }
 
+  if (error instanceof APIError && error.headers?.get('x-ccc-provider-error') === 'true' &&
+      (error.status === 401 || error.status === 403)) {
+    // Native authentication_failed notifications can launch Anthropic login UI.
+    // Compatible providers use the saved profile or OpenAI environment variables.
+    return createAssistantAPIErrorMessage({
+      error: 'invalid_request',
+      content: `Provider authentication failed. Check /provider or OPENAI_COMPATIBLE_API_KEY. ${API_ERROR_MESSAGE_PREFIX}: ${error.message}`,
+    })
+  }
+
   if (
     error instanceof Error &&
     error.message.toLowerCase().includes('x-api-key')

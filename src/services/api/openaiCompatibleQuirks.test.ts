@@ -39,6 +39,14 @@ describe('OpenAI-compatible provider quirks', () => {
       }),
     ).toBe(false)
   })
+
+  test('omits restricted Kimi sampling parameters and detects hosts with ports', () => {
+    for (const model of ['kimi-k2.5', 'moonshotai/kimi-k2.6', 'kimi-k3', 'kimi-k3-preview']) {
+      expect(shouldSendOpenAISamplingParams(model, {})).toBe(false)
+    }
+    expect(shouldSendOpenAISamplingParams('kimi-k2', {})).toBe(true)
+    expect(shouldSendOpenAIStreamOptions('https://api.mistral.ai:8443/v1', {})).toBe(false)
+  })
 })
 
 describe('Responses routing', () => {

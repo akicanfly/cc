@@ -39,6 +39,16 @@ function params(overrides: Record<string, unknown> = {}) {
 }
 
 describe('toResponsesRequest', () => {
+  test.each([false, true])('omits reasoning settings with stream=%s', stream => {
+    const body = toResponsesRequest(
+      params({ output_config: { effort: 'high' } }) as never,
+      stream,
+    )
+
+    expect(body).not.toHaveProperty('reasoning')
+    expect(body).not.toHaveProperty('reasoning_effort')
+  })
+
   test('maps system to instructions and text messages to input', () => {
     const body = toResponsesRequest(
       params({ system: 'be brief' }) as never,
@@ -178,7 +188,7 @@ describe('createResponsesMessage', () => {
       params() as never,
       'req_1',
     )
-    expect(message.content).toEqual([{ type: 'text', text: 'Hi there' }])
+    expect(message.content).toEqual([expect.objectContaining({ type: 'thinking', signature: expect.stringContaining('opaque') }), { type: 'text', text: 'Hi there' }])
     expect(message.stop_reason).toBe('end_turn')
     expect(message.usage).toEqual({
       input_tokens: 13,
@@ -339,5 +349,87 @@ describe('Responses adapter routing', () => {
     expect(starts).toHaveLength(1)
     expect(starts[0]?.content_block).toMatchObject({ type: 'tool_use', name: 'Read', id: 'call_r' })
     expect(events.at(-2)).toMatchObject({ delta: { stop_reason: 'tool_use' } })
+  })
+})
+
+describe('Responses reasoning and mixed output', () => {
+  test('preserves encrypted reasoning and output order in a non-streaming tool round trip', () => {
+    const request = params({ tools: [{ name: 'Read', input_schema: { type: 'object' } }] }) as never
+    const message = createResponsesMessage({ output: [
+      { type: 'reasoning', id: 'rs_1', encrypted_content: 'opaque', summary: [{ type: 'summary_text', text: 'reason' }] },
+      { type: 'function_call', call_id: 'call_1', name: 'Read', arguments: '{}' },
+      { type: 'message', content: [{ type: 'output_text', text: 'after' }] },
+    ] }, request, null)
+    expect((message.content as any[]).map(block => block.type)).toEqual(['thinking', 'tool_use', 'text'])
+    const replay = toResponsesRequest(params({ messages: [{ role: 'assistant', content: message.content }] }) as never, false)
+    expect(replay.input[0]).toEqual({ type: 'reasoning', id: 'rs_1', encrypted_content: 'opaque', summary: [{ type: 'summary_text', text: 'reason' }] })
+    expect(replay.input[1]).toMatchObject({ type: 'function_call', call_id: 'call_1' })
+    expect(replay.store).toBe(false)
+    expect(replay.include).toContain('reasoning.encrypted_content')
+    expect(replay).not.toHaveProperty('reasoning')
+  })
+
+  test('handles CRLF streams with reasoning, tools, and text without duplicate done events', async () => {
+    const frames = [
+      { type: 'response.output_item.added', output_index: 0, item: { type: 'reasoning', id: 'rs_1', summary: [] } },
+      { type: 'response.reasoning_summary_text.delta', output_index: 0, delta: 'reason' },
+      { type: 'response.output_item.done', output_index: 0, item: { type: 'reasoning', id: 'rs_1', summary: [{ type: 'summary_text', text: 'reason' }], encrypted_content: 'opaque' } },
+      { type: 'response.output_item.added', output_index: 1, item: { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'Read', arguments: '' } },
+      { type: 'response.function_call_arguments.delta', output_index: 1, delta: '{}' },
+      { type: 'response.output_item.done', output_index: 1, item: { type: 'function_call', call_id: 'call_1', name: 'Read', arguments: '{}' } },
+      { type: 'response.output_text.delta', output_index: 2, delta: 'after' },
+      { type: 'response.output_text.done', output_index: 2, text: 'after' },
+      { type: 'response.output_item.done', output_index: 2, item: { type: 'message', content: [{ type: 'output_text', text: 'after' }] } },
+      { type: 'response.completed', response: { status: 'completed', output: [], usage: { input_tokens: 10, input_tokens_details: { cached_tokens: 4 }, output_tokens: 3 } } },
+    ]
+    const client = createOpenAICompatibleAnthropicClient({ fetchOverride: async () => new Response(frames.map(frame => `data: ${JSON.stringify(frame)}\r\n\r\n`).join('')) }) as any
+    const { data } = await client.beta.messages.create(params({ stream: true, tools: [{ name: 'Read', input_schema: { type: 'object' } }] })).withResponse()
+    const events: any[] = []
+    for await (const event of data) events.push(event)
+    expect(events.filter(e => e.type === 'content_block_start').map(e => e.content_block.type)).toEqual(['thinking', 'tool_use', 'text'])
+    expect(events.filter(e => e.delta?.type === 'text_delta').map(e => e.delta.text).join('')).toBe('after')
+    expect(events.find(e => e.delta?.type === 'signature_delta').delta.signature).toContain('opaque')
+    expect(events.find(e => e.type === 'message_delta').usage.cache_read_input_tokens).toBe(4)
+    const open = new Set<number>()
+    for (const event of events) {
+      if (event.type === 'content_block_start') { expect(open.size).toBe(0); open.add(event.index) }
+      if (event.type === 'content_block_stop') expect(open.delete(event.index)).toBe(true)
+    }
+    expect(open.size).toBe(0)
+  })
+
+  test('does not replay failed streams and retains their error classification', async () => {
+    let attempts = 0
+    const client = createOpenAICompatibleAnthropicClient({ fetchOverride: async () => {
+      attempts++
+      return new Response('data: {"type":"response.output_text.delta","delta":"partial"}\n\ndata: {"type":"response.failed","response":{"error":{"code":"invalid_api_key","message":"bad key"}}}\n\n')
+    } }) as any
+    const { data } = await client.beta.messages.create(params({ stream: true })).withResponse()
+    await expect((async () => { for await (const _event of data) { /* drain */ } })()).rejects.toMatchObject({ status: 401 })
+    expect(attempts).toBe(1)
+  })
+})
+
+describe('Responses wire variants', () => {
+  test('accepts JSON responses when a provider ignores stream=true', async () => {
+    const client = createOpenAICompatibleAnthropicClient({ fetchOverride: async () => Response.json({ status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: 'whole answer' }] }] }) }) as any
+    const { data } = await client.beta.messages.create(params({ stream: true })).withResponse()
+    const events: any[] = []
+    for await (const event of data) events.push(event)
+    expect(events.filter(e => e.delta?.type === 'text_delta').map(e => e.delta.text).join('')).toBe('whole answer')
+    expect(events.at(-1).type).toBe('message_stop')
+  })
+  test('retains the textual tool-call fallback without emitting it as ordinary text', async () => {
+    const frames = [
+      { type: 'response.output_text.delta', delta: 'Tool call Read: ' },
+      { type: 'response.output_text.delta', delta: '{"file_path":"example"}' },
+      { type: 'response.completed', response: { status: 'completed' } },
+    ]
+    const client = createOpenAICompatibleAnthropicClient({ fetchOverride: async () => new Response(frames.map(frame => `data: ${JSON.stringify(frame)}\n\n`).join('')) }) as any
+    const { data } = await client.beta.messages.create(params({ stream: true, tools: [{ name: 'Read', input_schema: { type: 'object' } }] })).withResponse()
+    const events: any[] = []
+    for await (const event of data) events.push(event)
+    expect(events.filter(e => e.type === 'content_block_start').map(e => e.content_block.type)).toEqual(['tool_use'])
+    expect(events.find(e => e.delta?.type === 'input_json_delta').delta.partial_json).toBe('{"file_path":"example"}')
   })
 })

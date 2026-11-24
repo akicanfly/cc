@@ -36,6 +36,15 @@ afterEach(() => {
 })
 
 describe('OpenAI-compatible configuration', () => {
+  test('validates optional custom endpoint paths', () => {
+    process.env.OPENAI_COMPATIBLE_MODELS_PATH = '/custom/models?scope=chat'
+    expect(requireOpenAICompatibleConfig().modelsPath).toBe('/custom/models?scope=chat')
+    for (const path of ['https://elsewhere.example/models', '//elsewhere.example/models', '/bad#fragment', '/bad path', '/bad\\path']) {
+      process.env.OPENAI_COMPATIBLE_MODELS_PATH = path
+      expect(() => requireOpenAICompatibleConfig()).toThrow('endpoint paths must start')
+    }
+  })
+
   test('supports standard OpenAI aliases and trims trailing slashes', () => {
     delete process.env.OPENAI_COMPATIBLE_BASE_URL
     delete process.env.OPENAI_COMPATIBLE_API_KEY

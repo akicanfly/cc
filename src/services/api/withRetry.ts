@@ -694,6 +694,10 @@ function handleGcpCredentialError(error: unknown): boolean {
 }
 
 function shouldRetry(error: APIError): boolean {
+  // A compatible provider's rejected credentials/input cannot be repaired by
+  // refreshing Anthropic credentials or replaying the same request.
+  if (error.headers?.get('x-ccc-provider-error') === 'true' && error.status !== undefined &&
+      error.status >= 400 && error.status < 500 && ![408, 409, 429].includes(error.status)) return false
   // Never retry mock errors - they're from /mock-limits command for testing
   if (isMockRateLimitError(error)) {
     return false

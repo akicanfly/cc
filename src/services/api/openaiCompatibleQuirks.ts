@@ -1,4 +1,5 @@
 import { randomUUID } from 'crypto'
+import type { OpenAICompatibleProviderOptions } from 'src/utils/openAICompatibleOptions.js'
 
 type EnvLike = Record<string, string | undefined>
 
@@ -24,27 +25,28 @@ export function resetZenRunSessionId(): void {
   runSessionId = undefined
 }
 
-export function shouldSendOpenAIStreamOptions(baseURL: string, env: EnvLike = process.env): boolean {
-  const override = parseBooleanEnv(env.OPENAI_COMPATIBLE_STREAM_OPTIONS)
+export function shouldSendOpenAIStreamOptions(baseURL: string, env: EnvLike = process.env, options: OpenAICompatibleProviderOptions = {}): boolean {
+  const override = options.streamOptions ?? parseBooleanEnv(env.OPENAI_COMPATIBLE_STREAM_OPTIONS)
   if (override !== undefined) return override
 
   const host = openAICompatibleHost(baseURL)
   return !STREAM_OPTIONS_UNSUPPORTED_HOSTS.has(host)
 }
 
-export function shouldSendOpenAISamplingParams(model: string, env: EnvLike = process.env): boolean {
-  const override = parseBooleanEnv(env.OPENAI_COMPATIBLE_SAMPLING_PARAMS)
+export function shouldSendOpenAISamplingParams(model: string, env: EnvLike = process.env, options: OpenAICompatibleProviderOptions = {}): boolean {
+  const override = options.samplingParams ?? parseBooleanEnv(env.OPENAI_COMPATIBLE_SAMPLING_PARAMS)
   if (override !== undefined) return override
 
   const normalized = normalizeModelName(model)
-  return !isOpenAIReasoningOnlyModel(normalized)
+  return !isOpenAIReasoningOnlyModel(normalized) && !/^kimi-k(?:2[.-][56]|3)(?:[-.]|$)/.test(normalized)
 }
 
 export function shouldUseMaxCompletionTokens(
   model: string,
   env: EnvLike = process.env,
+  options: OpenAICompatibleProviderOptions = {},
 ): boolean {
-  const override = parseBooleanEnv(env.OPENAI_COMPATIBLE_MAX_COMPLETION_TOKENS)
+  const override = options.maxCompletionTokens ?? parseBooleanEnv(env.OPENAI_COMPATIBLE_MAX_COMPLETION_TOKENS)
   if (override !== undefined) return override
   return isOpenAIReasoningOnlyModel(normalizeModelName(model))
 }
@@ -53,7 +55,9 @@ export function shouldUseResponsesAPI(
   model: string,
   baseURL: string,
   env: EnvLike = process.env,
+  options: OpenAICompatibleProviderOptions = {},
 ): boolean {
+  if (options.apiMode && options.apiMode !== 'auto') return options.apiMode === 'responses'
   const override = parseBooleanEnv(env.OPENAI_COMPATIBLE_USE_RESPONSES)
   if (override !== undefined) return override
   if (openAICompatibleHost(baseURL) !== ZEN_HOST) return false
@@ -62,6 +66,10 @@ export function shouldUseResponsesAPI(
 
 export function isZenBaseURL(baseURL: string): boolean {
   return openAICompatibleHost(baseURL) === ZEN_HOST
+}
+
+export function isOpenRouterBaseURL(baseURL: string): boolean {
+  return openAICompatibleHost(baseURL) === 'openrouter.ai'
 }
 
 export function zenHeaders(
@@ -93,7 +101,7 @@ function normalizeModelName(model: string): string {
 
 function openAICompatibleHost(baseURL: string): string {
   try {
-    return new URL(baseURL).host.toLowerCase()
+    return new URL(baseURL).hostname.toLowerCase()
   } catch {
     return ''
   }

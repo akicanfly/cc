@@ -1,4 +1,5 @@
 import React, { useState } from 'react'
+import { parseOpenAICompatibleOptions, parseOpenAICompatibleOptionsJSON } from '../../utils/openAICompatibleOptions.js'
 import { Select } from '../../components/CustomSelect/select.js'
 import TextInput from '../../components/TextInput.js'
 import { Dialog } from '../../components/design-system/Dialog.js'
@@ -81,10 +82,6 @@ function ProviderManager({
         onCancel={() =>
           profiles.profiles.length > 0 ? setView({ type: 'menu' }) : cancel()
         }
-        onError={cause => {
-          setManagerError(cause instanceof Error ? cause.message : String(cause))
-          setView({ type: 'menu' })
-        }}
         onSave={profile => {
           const existingName = view.profile?.name
           const nextProfiles = existingName
@@ -121,7 +118,7 @@ function ProviderManager({
             label: `${profile.name} — ${profile.baseURL}`,
             value: profile.name,
           }))}
-          onChange={name => {
+          onChange={(name: string) => {
             const profile = profiles.profiles.find(item => item.name === name)
             if (!profile) return
             setView(
@@ -151,7 +148,7 @@ function ProviderManager({
             { label: 'Cancel', value: 'cancel' },
             { label: 'Delete profile', value: 'delete' },
           ]}
-          onChange={choice => {
+          onChange={(choice: string) => {
             if (choice !== 'delete') {
               setView({ type: 'menu' })
               return
@@ -212,7 +209,7 @@ function ProviderManager({
               ]
             : []),
         ]}
-        onChange={choice => {
+        onChange={(choice: string) => {
           if (choice.startsWith('activate:'))
             activate(choice.slice('activate:'.length))
           else if (choice === 'add') setView({ type: 'form' })
@@ -234,20 +231,19 @@ function ProviderForm({
   existingProfile,
   onSave,
   onCancel,
-  onError,
 }: {
   existingProfile?: OpenAICompatibleProviderProfile
   onSave: (profile: OpenAICompatibleProviderProfile) => void
   onCancel: () => void
-  onError: (cause: unknown) => void
 }) {
   const fields = existingProfile
-    ? (['baseURL', 'apiKey'] as const)
-    : (['name', 'baseURL', 'apiKey'] as const)
+    ? (['baseURL', 'apiKey', 'options'] as const)
+    : (['name', 'baseURL', 'apiKey', 'options'] as const)
   const [fieldIndex, setFieldIndex] = useState(0)
   const [name, setName] = useState(existingProfile?.name ?? '')
   const [baseURL, setBaseURL] = useState(existingProfile?.baseURL ?? '')
   const [apiKey, setApiKey] = useState('')
+  const [optionsJSON, setOptionsJSON] = useState('')
   const [error, setError] = useState<string>()
   const initialValue = fields[0] === 'name' ? name : baseURL
   const [cursorOffset, setCursorOffset] = useState(initialValue.length)
@@ -256,11 +252,12 @@ function ProviderForm({
   useKeybinding('confirm:no', onCancel, { context: 'Settings' })
 
   const field = fields[fieldIndex]!
-  const value = field === 'name' ? name : field === 'baseURL' ? baseURL : apiKey
+  const value = field === 'name' ? name : field === 'baseURL' ? baseURL : field === 'apiKey' ? apiKey : optionsJSON
   const setValue = (next: string) => {
     if (field === 'name') setName(next)
     else if (field === 'baseURL') setBaseURL(next)
-    else setApiKey(next)
+    else if (field === 'apiKey') setApiKey(next)
+    else setOptionsJSON(next)
     setError(undefined)
   }
 
@@ -293,14 +290,16 @@ function ProviderForm({
     try {
       // Empty is a valid submission for providers without authentication. When
       // editing, it intentionally means "keep the existing key".
-      const finalAPIKey = submittedValue || existingProfile?.apiKey
+      const finalAPIKey = apiKey || existingProfile?.apiKey
+      const options = submittedValue.trim() ? parseOpenAICompatibleOptionsJSON(submittedValue) : parseOpenAICompatibleOptions(existingProfile ?? {})
       onSave({
+        ...options,
         name: name.trim(),
         baseURL: baseURL.trim(),
         ...(finalAPIKey ? { apiKey: finalAPIKey } : {}),
       })
     } catch (cause) {
-      onError(cause)
+      setError(cause instanceof Error ? cause.message : String(cause))
     }
   }
 
@@ -309,13 +308,15 @@ function ProviderForm({
       ? 'Profile name'
       : field === 'baseURL'
         ? 'Base URL'
-        : 'API key'
+        : field === 'apiKey' ? 'API key' : 'Advanced provider settings'
   const description =
     field === 'name'
       ? 'A short unique name, such as openrouter or local'
       : field === 'baseURL'
         ? 'Include /v1 when required by the provider'
-        : existingProfile?.apiKey
+        : field === 'options'
+          ? 'Optional JSON: apiMode, headers, timeoutMs, endpoint paths, streamOptions, samplingParams, maxCompletionTokens, parameterFallback, schemaFallback. Blank keeps settings; {} resets them. Input is hidden because headers may contain credentials.'
+          : existingProfile?.apiKey
           ? 'Leave blank to keep the saved key'
           : 'Optional for providers that do not require authentication'
 
@@ -337,7 +338,7 @@ function ProviderForm({
             columns={Math.max(20, columns - 6)}
             cursorOffset={cursorOffset}
             onChangeCursorOffset={setCursorOffset}
-            mask={field === 'apiKey' ? '*' : undefined}
+            mask={field === 'apiKey' || field === 'options' ? '*' : undefined}
             disableEscapeDoublePress
             focus
             showCursor

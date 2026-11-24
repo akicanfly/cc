@@ -1,13 +1,17 @@
+import { readCompatibleSSE as readSSE } from './openaiCompatibleSSE.js'
+import { parseToolInput, isPotentialTextualToolCall, parseTextualToolCall, validateToolName } from './openaiCompatibleTools.js'
 import type { ClientOptions } from '@anthropic-ai/sdk'
 import {
   APIConnectionError,
-  APIConnectionTimeoutError,
   APIError,
   APIUserAbortError,
 } from '@anthropic-ai/sdk/error'
 import type { BetaMessageStreamParams } from '@anthropic-ai/sdk/resources/beta/messages/messages.mjs'
 import { randomUUID } from 'crypto'
-import { lowerThinking } from './effort/lowerThinking.js'
+import { compatibleText, compatibleReasoning, compatibleUsage, stringifyCompatibleJSON as stringifyJson, readCompatibleJSON, type CompatibleContent } from './openaiCompatiblePayload.js'
+import { appendReasoningDetails, reasoningSignature, type ReasoningDetail } from './openaiCompatibleReasoning.js'
+import { systemMessages, toOpenAIMessages, type OpenAIMessage } from './openaiCompatibleMessages.js'
+import { postCompatibleRequest, connectionFailureMessage, compatibleRequestHeaders, compatibleTimeoutError } from './openaiCompatibleTransport.js'
 import {
   createOpenAICompatibleResponseError,
   createOpenAICompatibleStreamError,
@@ -19,16 +23,13 @@ import {
   shouldSendOpenAIStreamOptions,
   shouldUseMaxCompletionTokens,
   shouldUseResponsesAPI,
-  zenHeaders,
+  isOpenRouterBaseURL,
 } from './openaiCompatibleQuirks.js'
 import {
   createResponsesMessage,
   fromResponsesStream,
   toResponsesRequest,
 } from './openaiCompatibleResponses.js'
-import { getVariantBlob } from 'src/utils/effort/modelVariants.js'
-import type { VariantBlob } from 'src/utils/effort/variantTypes.js'
-import { isVariantID } from 'src/utils/effort/variantTypes.js'
 import {
   type OpenAICompatibleConfig,
   requireOpenAICompatibleConfig,
@@ -54,27 +55,6 @@ type OpenAIToolChoice =
   | 'required'
   | { type: 'function'; function: { name: string } }
 
-type OpenAIUserContentPart =
-  | { type: 'text'; text: string }
-  | { type: 'image_url'; image_url: { url: string } }
-
-type OpenAIMessage =
-  | { role: 'system'; content: string }
-  | {
-      role: 'user'
-      content: string | OpenAIUserContentPart[]
-    }
-  | {
-      role: 'assistant'
-      content: string | null
-      tool_calls?: Array<{
-        id: string
-        type: 'function'
-        function: { name: string; arguments: string }
-      }>
-    }
-  | { role: 'tool'; tool_call_id: string; content: string }
-
 type OpenAIChatRequest = {
   model: string
   stream: boolean
@@ -87,7 +67,8 @@ type OpenAIChatRequest = {
   temperature?: number
   top_p?: number
   stop?: string[]
-  reasoning_effort?: string
+  usage?: { include: boolean }
+  provider?: { require_parameters: boolean }
   response_format?: {
     type: 'json_schema'
     json_schema: { name: string; strict: boolean; schema: unknown }
@@ -99,7 +80,10 @@ type OpenAIChatCompletion = {
   choices?: Array<{
     finish_reason?: string | null
     message?: {
-      content?: string | null
+      content?: CompatibleContent
+      reasoning_content?: string | null
+      reasoning?: string | null
+      reasoning_details?: ReasoningDetail[]
       tool_calls?: Array<{
         id?: string
         type?: string
@@ -110,16 +94,11 @@ type OpenAIChatCompletion = {
   usage?: OpenAIUsage
 }
 
-type OpenAIContentPart = {
-  type?: string | null
-  text?: string | null
-  thinking?: string | Array<{ type?: string | null; text?: string | null }> | null
-}
-
 type OpenAIChunkDelta = {
-  content?: string | OpenAIContentPart[] | null
+  content?: CompatibleContent
   reasoning_content?: string | null
   reasoning?: string | null
+  reasoning_details?: ReasoningDetail[]
   tool_calls?: OpenAIToolCallDelta[] | null
 }
 
@@ -144,6 +123,8 @@ type OpenAIUsage = {
   prompt_tokens?: number
   completion_tokens?: number
   prompt_tokens_details?: { cached_tokens?: number } | null
+  cached_tokens?: number
+  prompt_cache_hit_tokens?: number
 }
 
 type ToolAccumulator = {
@@ -158,26 +139,17 @@ export async function listOpenAICompatibleModels(): Promise<string[]> {
   const timeout = timeoutSignal(config.timeoutMs)
   let response: Response
   try {
-    response = await globalThis.fetch(`${config.baseURL}/models`, {
+    response = await globalThis.fetch(`${config.baseURL}${config.modelsPath ?? '/models'}`, {
       method: 'GET',
       signal: timeout,
-      headers: {
-        ...config.headers,
-        ...(config.apiKey
-          ? { Authorization: `Bearer ${config.apiKey}` }
-          : {}),
-        'Content-Type': 'application/json',
-      },
+      headers: compatibleRequestHeaders(config),
     })
   } catch (error) {
     if (timeout.aborted) {
-      throw new APIConnectionTimeoutError({
-        message: 'OpenAI-compatible models request timed out',
-        cause: error instanceof Error ? error : undefined,
-      })
+      throw compatibleTimeoutError('OpenAI-compatible models request timed out', error)
     }
     throw new APIConnectionError({
-      message: 'OpenAI-compatible models request failed',
+      message: connectionFailureMessage(config.baseURL, error),
       cause: error instanceof Error ? error : undefined,
     })
   }
@@ -186,9 +158,12 @@ export async function listOpenAICompatibleModels(): Promise<string[]> {
     throw await createOpenAICompatibleResponseError(response, 'models request')
   }
 
-  const parsed = (await response.json()) as { data?: Array<{ id?: string }> }
-  return (parsed.data ?? [])
-    .map(model => model.id)
+  const parsed = await readCompatibleJSON(response)
+  if (!Array.isArray(parsed.data)) {
+    throw new Error('OpenAI-compatible models response did not contain a data array; enter a model ID manually if this provider has no model catalogue')
+  }
+  return (parsed.data as Array<{ id?: string }>)
+    .map(model => model && typeof model === 'object' ? model.id : undefined)
     .filter((id): id is string => typeof id === 'string' && id.length > 0)
 }
 
@@ -234,7 +209,7 @@ async function createOpenAICompatibleMessage(
   fetchOverride: ClientOptions['fetch'] | undefined,
 ): Promise<Record<string, unknown>> {
   const config = requireOpenAICompatibleConfig()
-  if (shouldUseResponsesAPI(params.model, config.baseURL)) {
+  if (shouldUseResponsesAPI(params.model, config.baseURL, {}, config)) {
     const response = await postOpenAIResponse({
       config,
       params,
@@ -243,7 +218,7 @@ async function createOpenAICompatibleMessage(
       timeoutMs,
       fetchOverride,
     })
-    const parsed = (await response.json()) as Parameters<typeof createResponsesMessage>[0]
+    const parsed = (await readCompatibleJSON(response)) as Parameters<typeof createResponsesMessage>[0]
     return createResponsesMessage(
       parsed,
       params,
@@ -259,13 +234,18 @@ async function createOpenAICompatibleMessage(
     fetchOverride,
   })
 
-  const parsed = (await response.json()) as OpenAIChatCompletion
+  const parsed = (await readCompatibleJSON(response)) as OpenAIChatCompletion
   const message = parsed.choices?.[0]?.message
   if (!message) {
     throw new Error('OpenAI-compatible response did not contain choices[0].message')
   }
-  const textualToolCall = parseTextualToolCall(message.content, params)
+  const textualToolCall = parseTextualToolCall(compatibleText(message.content), params)
   const content: Array<Record<string, unknown>> = []
+  const reasoning = compatibleReasoning(message)
+  if (reasoning || message.reasoning_details?.length) content.push({
+    type: 'thinking', thinking: reasoning,
+    signature: message.reasoning_details?.length ? reasoningSignature(message.reasoning_details) : '',
+  })
 
   if (textualToolCall && !message?.tool_calls?.length) {
     content.push({
@@ -275,8 +255,10 @@ async function createOpenAICompatibleMessage(
       input: textualToolCall.input,
     })
   } else {
-    if (message?.content) content.push({ type: 'text', text: message.content })
+    const text = compatibleText(message.content)
+    if (text) content.push({ type: 'text', text })
     for (const toolCall of message?.tool_calls ?? []) {
+      if (toolCall.type && toolCall.type !== 'function') continue
       const name = toolCall.function?.name
       if (!name) {
         throw new Error('OpenAI-compatible tool call did not include a name')
@@ -298,11 +280,11 @@ async function createOpenAICompatibleMessage(
     model: params.model,
     content,
     stop_reason:
-      textualToolCall && !message?.tool_calls?.length
+      content.some(block => block.type === 'tool_use')
         ? 'tool_use'
         : mapStopReason(parsed.choices?.[0]?.finish_reason),
     stop_sequence: null,
-    usage: toAnthropicUsage(parsed.usage),
+    usage: compatibleUsage(parsed.usage),
     _request_id: response.headers.get('x-request-id') ?? undefined,
   }
 }
@@ -319,7 +301,7 @@ async function createOpenAICompatibleStream(
 }> {
   const config = requireOpenAICompatibleConfig()
   const controller = linkedAbortController(signal)
-  if (shouldUseResponsesAPI(params.model, config.baseURL)) {
+  if (shouldUseResponsesAPI(params.model, config.baseURL, {}, config)) {
     const response = await postOpenAIResponse({
       config,
       params,
@@ -333,7 +315,7 @@ async function createOpenAICompatibleStream(
     }
     const requestId = response.headers.get('x-request-id')
     return {
-      data: fromResponsesStream(response.body, params, controller),
+      data: fromResponsesStream(await compatibleResponseBody(response, true), params, controller, response.headers),
       response,
       request_id: requestId,
     }
@@ -352,8 +334,9 @@ async function createOpenAICompatibleStream(
   }
 
   const requestId = response.headers.get('x-request-id')
+  const body = await compatibleResponseBody(response, false)
   return {
-    data: fromOpenAIStream(response.body, params, controller),
+    data: fromOpenAIStream(body, params, controller),
     response,
     request_id: requestId,
   }
@@ -378,38 +361,21 @@ async function postOpenAIChatCompletion({
   const requestSignal = combineAbortSignals(signal, timeout)
 
   try {
-    const response = await (fetchOverride ?? globalThis.fetch)(
-      `${config.baseURL.replace(/\/+$/, '')}/chat/completions`,
-      {
-        method: 'POST',
-          signal: requestSignal,
-        headers: {
-          ...config.headers,
-          ...zenHeaders(config.baseURL, config.headers),
-          ...(config.apiKey
-            ? { Authorization: `Bearer ${config.apiKey}` }
-            : {}),
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(toOpenAIRequest(params, stream, config)),
-      },
-    )
-
-    if (!response.ok) {
-      throw await createOpenAICompatibleResponseError(response, 'chat completion request')
-    }
-    return response
+    return await postCompatibleRequest({
+      config,
+      path: config.chatCompletionsPath ?? '/chat/completions',
+      body: toOpenAIRequest(params, stream, config),
+      signal: requestSignal,
+      fetchOverride,
+    })
   } catch (error) {
     if (signal?.aborted) throw new APIUserAbortError()
     if (timeout.aborted) {
-      throw new APIConnectionTimeoutError({
-        message: 'OpenAI-compatible request timed out',
-        cause: error instanceof Error ? error : undefined,
-      })
+      throw compatibleTimeoutError('OpenAI-compatible request timed out', error)
     }
     if (error instanceof APIError) throw error
     throw new APIConnectionError({
-      message: 'OpenAI-compatible request failed',
+      message: connectionFailureMessage(config.baseURL, error),
       cause: error instanceof Error ? error : undefined,
     })
   }
@@ -434,38 +400,21 @@ async function postOpenAIResponse({
   const requestSignal = combineAbortSignals(signal, timeout)
 
   try {
-    const response = await (fetchOverride ?? globalThis.fetch)(
-      `${config.baseURL.replace(/\/+$/, '')}/responses`,
-      {
-        method: 'POST',
-          signal: requestSignal,
-        headers: {
-          ...config.headers,
-          ...zenHeaders(config.baseURL, config.headers),
-          ...(config.apiKey
-            ? { Authorization: `Bearer ${config.apiKey}` }
-            : {}),
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify(toResponsesRequest(params, stream)),
-      },
-    )
-
-    if (!response.ok) {
-      throw await createOpenAICompatibleResponseError(response, 'responses request')
-    }
-    return response
+    return await postCompatibleRequest({
+      config,
+      path: config.responsesPath ?? '/responses',
+      body: toResponsesRequest(params, stream, config),
+      signal: requestSignal,
+      fetchOverride,
+    })
   } catch (error) {
     if (signal?.aborted) throw new APIUserAbortError()
     if (timeout.aborted) {
-      throw new APIConnectionTimeoutError({
-        message: 'Responses request timed out',
-        cause: error instanceof Error ? error : undefined,
-      })
+      throw compatibleTimeoutError('Responses request timed out', error)
     }
     if (error instanceof APIError) throw error
     throw new APIConnectionError({
-      message: 'Responses request failed',
+      message: connectionFailureMessage(config.baseURL, error),
       cause: error instanceof Error ? error : undefined,
     })
   }
@@ -477,33 +426,23 @@ function toOpenAIRequest(
   config: OpenAICompatibleConfig,
 ): OpenAIChatRequest {
   const toolChoice = toOpenAIToolChoice(params.tool_choice)
-  const requestedEffort = params.output_config?.effort
-  const variantBlob =
-    typeof requestedEffort === 'string' && isVariantID(requestedEffort)
-      ? getVariantBlob(params.model, requestedEffort)
-      : undefined
-  const loweredThinking = lowerThinking(
-    { model: params.model, maxOutputTokens: params.max_tokens },
-    'openai_compatible',
-    variantBlob,
-  )
-  const sendSamplingParams = shouldSendOpenAISamplingParams(params.model)
+  const sendSamplingParams = shouldSendOpenAISamplingParams(params.model, {}, config)
 
   const tools = params.tools?.length
     ? params.tools.map(toOpenAITool)
     : undefined
-  const variantReasoningEffort = extractReasoningEffortFromVariant(variantBlob)
   const tokenLimit = params.max_tokens
-  const useCompletionTokens = shouldUseMaxCompletionTokens(params.model)
+  const useCompletionTokens = shouldUseMaxCompletionTokens(params.model, {}, config)
   const responseFormat = toOpenAIResponseFormat(params.output_config?.format)
+  const openRouter = isOpenRouterBaseURL(config.baseURL)
 
   return {
     model: params.model,
     stream,
-    ...(stream && shouldSendOpenAIStreamOptions(config.baseURL) ? { stream_options: { include_usage: true } } : {}),
+    ...(stream && shouldSendOpenAIStreamOptions(config.baseURL, {}, config) ? { stream_options: { include_usage: true } } : {}),
     messages: [
-      ...systemMessages(params.system),
-      ...params.messages.flatMap(message => toOpenAIMessages(message)),
+      ...systemMessages(params.system, openRouter),
+      ...params.messages.flatMap(message => toOpenAIMessages(message, openRouter)),
     ],
     ...(tools ? { tools } : {}),
     ...(toolChoice ? { tool_choice: toolChoice } : {}),
@@ -515,9 +454,11 @@ function toOpenAIRequest(
     ...(sendSamplingParams && params.temperature !== undefined ? { temperature: params.temperature } : {}),
     ...(sendSamplingParams && params.top_p !== undefined ? { top_p: params.top_p } : {}),
     ...(params.stop_sequences?.length ? { stop: params.stop_sequences } : {}),
-    ...(variantReasoningEffort ? { reasoning_effort: variantReasoningEffort } : {}),
     ...(responseFormat ? { response_format: responseFormat } : {}),
-    ...loweredThinking.extraBodyParams,
+    ...(openRouter ? {
+      usage: { include: true },
+      ...(tools || responseFormat ? { provider: { require_parameters: true } } : {}),
+    } : {}),
   }
 }
 
@@ -529,13 +470,6 @@ function toOpenAIResponseFormat(format: unknown): OpenAIChatRequest['response_fo
     type: 'json_schema',
     json_schema: { name: 'response', strict: true, schema: value.schema },
   }
-}
-
-function extractReasoningEffortFromVariant(
-  variantBlob: VariantBlob | undefined,
-): string | undefined {
-  const effort = variantBlob?.reasoningEffort
-  return typeof effort === 'string' && effort.length > 0 ? effort : undefined
 }
 
 function toOpenAITool(tool: NonNullable<BetaMessageStreamParams['tools']>[number]): OpenAIChatTool {
@@ -559,122 +493,6 @@ function toOpenAIToolChoice(toolChoice: BetaMessageStreamParams['tool_choice']):
   return undefined
 }
 
-function systemMessages(system: BetaMessageStreamParams['system']): OpenAIMessage[] {
-  if (!system) return []
-  if (typeof system === 'string') return [{ role: 'system', content: system }]
-  const text = system.map(block => ('text' in block ? block.text : '')).filter(Boolean).join('\n')
-  return text ? [{ role: 'system', content: text }] : []
-}
-
-function toOpenAIMessages(
-  message: BetaMessageStreamParams['messages'][number],
-): OpenAIMessage[] {
-  if (typeof message.content === 'string') return [{ role: message.role, content: message.content }]
-
-  const content = message.content as Array<{ type: string } & Record<string, unknown>>
-  if (message.role === 'assistant') return toOpenAIAssistantMessages(content)
-  return toOpenAIUserMessages(content)
-}
-
-function toOpenAIAssistantMessages(content: Array<{ type: string } & Record<string, unknown>>): OpenAIMessage[] {
-  const messages: OpenAIMessage[] = []
-  let textParts: string[] = []
-  let toolCalls: NonNullable<Extract<OpenAIMessage, { role: 'assistant' }>['tool_calls']> = []
-
-  const flush = () => {
-    if (!textParts.length && !toolCalls.length) return
-    const text = textParts.join('\n')
-    messages.push({
-      role: 'assistant',
-      content: text || null,
-      ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
-    })
-    textParts = []
-    toolCalls = []
-  }
-
-  for (const block of content) {
-    if (block.type === 'text') {
-      if (toolCalls.length) flush()
-      const text = asString(block.text)
-      if (text) textParts.push(text)
-      continue
-    }
-    if (block.type === 'tool_use') {
-      toolCalls.push({
-        id: asString(block.id) ?? `toolu_${randomUUID()}`,
-        type: 'function',
-        function: {
-          name: asString(block.name) ?? 'tool',
-          arguments: stringifyJson(block.input ?? {}),
-        },
-      })
-    }
-  }
-
-  flush()
-  return messages.length ? messages : [{ role: 'assistant', content: null }]
-}
-
-function toOpenAIUserMessages(
-  content: Array<{ type: string } & Record<string, unknown>>,
-): OpenAIMessage[] {
-  const messages: OpenAIMessage[] = []
-  let contentParts: OpenAIUserContentPart[] = []
-
-  const flushContent = () => {
-    if (!contentParts.length) return
-    if (contentParts.length === 1 && contentParts[0]?.type === 'text') {
-      messages.push({ role: 'user', content: contentParts[0].text })
-    } else {
-      messages.push({ role: 'user', content: contentParts })
-    }
-    contentParts = []
-  }
-
-  for (const block of content) {
-    if (block.type === 'text') {
-      contentParts.push({ type: 'text', text: asString(block.text) ?? '' })
-      continue
-    }
-    if (block.type === 'image') {
-      const source = block.source as {
-        type?: unknown
-        media_type?: unknown
-        data?: unknown
-        url?: unknown
-      } | undefined
-      const mediaType = asString(source?.media_type)
-      const data = asString(source?.data)
-      if (mediaType && data) {
-        contentParts.push({
-          type: 'image_url',
-          image_url: { url: `data:${mediaType};base64,${data}` },
-        })
-      } else if (asString(source?.url)) {
-        contentParts.push({
-          type: 'image_url',
-          image_url: { url: asString(source?.url)! },
-        })
-      } else {
-        throw new Error('OpenAI-compatible image block has an unsupported source')
-      }
-      continue
-    }
-    if (block.type === 'tool_result') {
-      flushContent()
-      messages.push({
-        role: 'tool',
-        tool_call_id: asString(block.tool_use_id) ?? '',
-        content: toolResultContent(block.content),
-      })
-    }
-  }
-
-  flushContent()
-  return messages.length ? messages : [{ role: 'user', content: '' }]
-}
-
 function fromOpenAIStream(
   body: ReadableStream<Uint8Array>,
   params: BetaMessageStreamParams,
@@ -692,7 +510,7 @@ function fromOpenAIStream(
         content: [],
         stop_reason: null,
         stop_sequence: null,
-        usage: toAnthropicUsage(),
+        usage: compatibleUsage(),
       },
     }
 
@@ -702,9 +520,11 @@ function fromOpenAIStream(
     let textBlockIndex: number | undefined
     let textualToolCandidate = ''
     let stopReason: string | null = null
-    let usage = toAnthropicUsage()
+    let usage = compatibleUsage()
     let sawChoice = false
     let sawFinishReason = false
+    let sawToolCall = false
+    const details = new Map<number, ReasoningDetail>()
     const tools = new Map<number, ToolAccumulator>()
 
     for await (const frame of readSSE(body)) {
@@ -712,7 +532,7 @@ function fromOpenAIStream(
         if (isOpenAIErrorPayload(parsed)) {
           throw createOpenAICompatibleStreamError(parsed)
         }
-        if (parsed.usage) usage = toAnthropicUsage(parsed.usage)
+        if (parsed.usage) usage = compatibleUsage(parsed.usage)
         const choice = parsed.choices?.[0]
         if (choice) sawChoice = true
         if (choice?.finish_reason) {
@@ -722,12 +542,16 @@ function fromOpenAIStream(
         const delta = choice?.delta ?? choice?.message
         if (!delta) continue
 
-        const reasoning = reasoningDeltaText(delta)
-        if (reasoning) {
+        if (delta.reasoning_details) appendReasoningDetails(details, delta.reasoning_details)
+        const reasoning = compatibleReasoning(delta)
+        if (reasoning || delta.reasoning_details?.length) {
+          if (textBlockIndex !== undefined) {
+            yield { type: 'content_block_stop', index: textBlockIndex }
+            textBlockIndex = undefined
+          }
           if (tools.size > 0) {
-            throw new Error(
-              'OpenAI-compatible stream emitted reasoning after tool calls',
-            )
+            yield* emitToolBlocks(tools, params)
+            tools.clear()
           }
           const previousIndex = reasoningBlockIndex
           reasoningBlockIndex = yield* yieldReasoningDelta(
@@ -739,15 +563,14 @@ function fromOpenAIStream(
           if (previousIndex === undefined) nextBlockIndex += 1
         }
 
-        const text = textDeltaText(delta)
+        const text = compatibleText(delta.content)
         if (text) {
           if (tools.size > 0) {
-            throw new Error(
-              'OpenAI-compatible stream emitted text after tool calls',
-            )
+            yield* emitToolBlocks(tools, params)
+            tools.clear()
           }
           if (reasoningBlockOpen && reasoningBlockIndex !== undefined) {
-            yield { type: 'content_block_stop', index: reasoningBlockIndex }
+            yield* closeReasoningBlock(reasoningBlockIndex, details)
             reasoningBlockOpen = false
             reasoningBlockIndex = undefined
           }
@@ -766,9 +589,12 @@ function fromOpenAIStream(
           }
         }
 
-        for (const toolDelta of delta.tool_calls ?? []) {
+        for (const [fallbackIndex, toolDelta] of (delta.tool_calls ?? []).entries()) {
+          if (toolDelta.type && toolDelta.type !== 'function') continue
+          sawToolCall = true
+          toolDelta.index ??= fallbackIndex
           if (reasoningBlockOpen && reasoningBlockIndex !== undefined) {
-            yield { type: 'content_block_stop', index: reasoningBlockIndex }
+            yield* closeReasoningBlock(reasoningBlockIndex, details)
             reasoningBlockOpen = false
             reasoningBlockIndex = undefined
           }
@@ -786,7 +612,7 @@ function fromOpenAIStream(
       throw new Error('OpenAI-compatible stream ended before a finish reason was received')
     }
 
-    const textualToolCall = tools.size === 0
+    const textualToolCall = !sawToolCall && tools.size === 0
       ? parseTextualToolCall(textualToolCandidate, params)
       : null
     if (textualToolCall) {
@@ -808,36 +634,10 @@ function fromOpenAIStream(
       if (previousIndex === undefined) nextBlockIndex += 1
     }
 
-    if (reasoningBlockOpen && reasoningBlockIndex !== undefined) yield { type: 'content_block_stop', index: reasoningBlockIndex }
+    if (reasoningBlockOpen && reasoningBlockIndex !== undefined) yield* closeReasoningBlock(reasoningBlockIndex, details)
     if (textBlockIndex !== undefined) yield { type: 'content_block_stop', index: textBlockIndex }
-    for (const tool of [...tools.values()].sort(
-      (a, b) => a.blockIndex - b.blockIndex,
-    )) {
-      if (!tool.name) {
-        throw new Error('OpenAI-compatible tool call did not include a name')
-      }
-      validateToolName(tool.name, params)
-      parseToolInput(tool.arguments)
-      yield {
-        type: 'content_block_start',
-        index: tool.blockIndex,
-        content_block: {
-          type: 'tool_use',
-          id: tool.id ?? `toolu_${randomUUID()}`,
-          name: tool.name,
-          input: {},
-        },
-      }
-      yield {
-        type: 'content_block_delta',
-        index: tool.blockIndex,
-        delta: {
-          type: 'input_json_delta',
-          partial_json: tool.arguments || '{}',
-        },
-      }
-      yield { type: 'content_block_stop', index: tool.blockIndex }
-    }
+    yield* emitToolBlocks(tools, params)
+    if (sawToolCall && stopReason === 'end_turn') stopReason = 'tool_use'
     yield {
       type: 'message_delta',
       delta: { stop_reason: stopReason ?? 'end_turn', stop_sequence: null },
@@ -847,6 +647,48 @@ function fromOpenAIStream(
   })() as unknown as AsyncIterable<AnthropicStreamEvent> & { controller: AbortController }
   stream.controller = controller
   return stream
+}
+
+function* closeReasoningBlock(index: number, details: Map<number, ReasoningDetail>): Generator<AnthropicStreamEvent> {
+  if (details.size) {
+    yield { type: 'content_block_delta', index, delta: { type: 'signature_delta', signature: reasoningSignature([...details.entries()].sort(([a], [b]) => a - b).map(([, value]) => value)) } }
+    details.clear()
+  }
+  yield { type: 'content_block_stop', index }
+}
+
+function* emitToolBlocks(
+  tools: Map<number, ToolAccumulator>,
+  params: BetaMessageStreamParams,
+): Generator<AnthropicStreamEvent> {
+  for (const tool of [...tools.values()].sort(
+    (a, b) => a.blockIndex - b.blockIndex,
+  )) {
+    if (!tool.name) {
+      throw new Error('OpenAI-compatible tool call did not include a name')
+    }
+    validateToolName(tool.name, params)
+    parseToolInput(tool.arguments)
+    yield {
+      type: 'content_block_start',
+      index: tool.blockIndex,
+      content_block: {
+        type: 'tool_use',
+        id: tool.id ?? `toolu_${randomUUID()}`,
+        name: tool.name,
+        input: {},
+      },
+    }
+    yield {
+      type: 'content_block_delta',
+      index: tool.blockIndex,
+      delta: {
+        type: 'input_json_delta',
+        partial_json: tool.arguments || '{}',
+      },
+    }
+    yield { type: 'content_block_stop', index: tool.blockIndex }
+  }
 }
 
 function* yieldReasoningDelta(
@@ -896,64 +738,6 @@ function appendToolDelta(
   return { created }
 }
 
-async function* readSSE(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
-  const reader = body.getReader()
-  const decoder = new TextDecoder()
-  let buffer = ''
-  try {
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-      buffer += decoder.decode(value, { stream: true })
-      yield* drainSSEBuffer(buffer, nextSSEBoundary(buffer))
-      buffer = remainingSSEBuffer(buffer)
-    }
-    buffer += decoder.decode()
-    if (buffer.trim()) yield* parseSSEEvent(buffer)
-  } finally {
-    reader.releaseLock()
-  }
-}
-
-function* drainSSEBuffer(buffer: string, boundary: { index: number; length: number } | null): Generator<string> {
-  let current = buffer
-  let found = boundary
-  while (found) {
-    yield* parseSSEEvent(current.slice(0, found.index))
-    current = current.slice(found.index + found.length)
-    found = nextSSEBoundary(current)
-  }
-}
-
-function remainingSSEBuffer(buffer: string): string {
-  let current = buffer
-  let found = nextSSEBoundary(current)
-  while (found) {
-    current = current.slice(found.index + found.length)
-    found = nextSSEBoundary(current)
-  }
-  return current
-}
-
-function nextSSEBoundary(buffer: string): { index: number; length: number } | null {
-  const lf = buffer.indexOf('\n\n')
-  const crlf = buffer.indexOf('\r\n\r\n')
-  if (lf === -1 && crlf === -1) return null
-  if (lf === -1) return { index: crlf, length: 4 }
-  if (crlf === -1) return { index: lf, length: 2 }
-  return crlf < lf ? { index: crlf, length: 4 } : { index: lf, length: 2 }
-}
-
-function* parseSSEEvent(event: string): Generator<string> {
-  const data = event
-    .split(/\r?\n/)
-    .filter(line => line.startsWith('data:'))
-    .map(line => line.slice(5).trimStart())
-    .join('\n')
-    .trim()
-  if (data && data !== '[DONE]') yield data
-}
-
 function parseOpenAIChunks(frame: string): Array<OpenAIChunk | OpenAIErrorPayload> {
   try {
     return [JSON.parse(frame) as OpenAIChunk | OpenAIErrorPayload]
@@ -973,34 +757,6 @@ function parseOpenAIChunks(frame: string): Array<OpenAIChunk | OpenAIErrorPayloa
   }
 }
 
-function reasoningDeltaText(delta: OpenAIChunkDelta): string {
-  return delta.reasoning_content ?? delta.reasoning ?? thinkingContent(delta.content) ?? ''
-}
-
-function textDeltaText(delta: OpenAIChunkDelta): string {
-  const content = delta.content
-  if (typeof content === 'string') return content
-  if (!Array.isArray(content)) return ''
-  return content
-    .map(part => (part.type === 'text' ? part.text ?? '' : ''))
-    .filter(Boolean)
-    .join('')
-}
-
-function thinkingContent(content: OpenAIChunkDelta['content']): string | undefined {
-  if (!Array.isArray(content)) return undefined
-  const thinking = content
-    .filter(part => part.type === 'thinking')
-    .flatMap(part => {
-      if (typeof part.thinking === 'string') return [part.thinking]
-      if (Array.isArray(part.thinking)) return part.thinking.map(item => item.text ?? '')
-      return []
-    })
-    .filter(Boolean)
-    .join('')
-  return thinking || undefined
-}
-
 function mapStopReason(reason: string | null | undefined): string {
   if (reason === 'length') return 'max_tokens'
   if (reason === 'tool_calls' || reason === 'function_call') return 'tool_use'
@@ -1008,115 +764,8 @@ function mapStopReason(reason: string | null | undefined): string {
   return 'end_turn'
 }
 
-function toAnthropicUsage(usage?: OpenAIUsage | null) {
-  const promptTokens = finiteTokenCount(usage?.prompt_tokens)
-  const cachedTokens = Math.min(
-    promptTokens,
-    finiteTokenCount(usage?.prompt_tokens_details?.cached_tokens),
-  )
-  return {
-    input_tokens: promptTokens - cachedTokens,
-    output_tokens: finiteTokenCount(usage?.completion_tokens),
-    cache_read_input_tokens: cachedTokens,
-    cache_creation_input_tokens: 0,
-  }
-}
-
-function finiteTokenCount(value: number | undefined): number {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0
-    ? Math.floor(value)
-    : 0
-}
-
 function asString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined
-}
-
-function parseToolInput(input: string | undefined): unknown {
-  if (!input) return {}
-  try {
-    const parsed = JSON.parse(input) as unknown
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-      throw new Error('OpenAI-compatible tool arguments must be a JSON object')
-    }
-    return parsed
-  } catch {
-    throw new Error('OpenAI-compatible tool arguments were not valid JSON')
-  }
-}
-
-function toolResultContent(content: unknown): string {
-  if (typeof content === 'string') return content
-  if (Array.isArray(content)) {
-    return content
-      .map(item => {
-        if (item && typeof item === 'object' && 'type' in item && item.type === 'text' && 'text' in item) {
-          return String(item.text)
-        }
-        return stringifyJson(item)
-      })
-      .join('\n')
-  }
-  return stringifyJson(content ?? '')
-}
-
-function stringifyJson(value: unknown): string {
-  try {
-    return JSON.stringify(value)
-  } catch {
-    return String(value)
-  }
-}
-
-function isPotentialTextualToolCall(text: string): boolean {
-  const trimmed = text.trimStart()
-  return 'Tool call'.startsWith(trimmed) || trimmed.startsWith('Tool call')
-}
-
-function parseTextualToolCall(
-  text: string | null | undefined,
-  params: BetaMessageStreamParams,
-): { name: string; input: unknown } | null {
-  if (!text) return null
-  const match = text.trim().match(/^Tool call\s+([A-Za-z0-9_-]+):\s*([\s\S]+)$/)
-  if (!match) return null
-  try {
-    validateToolName(match[1]!, params)
-  } catch {
-    return null
-  }
-  try {
-    const input = JSON.parse(match[2]!.trim()) as unknown
-    if (!input || typeof input !== 'object' || Array.isArray(input)) return null
-    return { name: match[1]!, input }
-  } catch {
-    return null
-  }
-}
-
-function validateToolName(
-  name: string,
-  params: BetaMessageStreamParams,
-): void {
-  if (params.tool_choice?.type === 'none') {
-    throw new Error('OpenAI-compatible provider returned a tool call when tools were disabled')
-  }
-  const offeredTools = new Set(
-    (params.tools ?? []).flatMap(tool =>
-      'name' in tool && typeof tool.name === 'string' ? [tool.name] : [],
-    ),
-  )
-  if (!offeredTools.has(name)) {
-    throw new Error(`OpenAI-compatible provider returned unoffered tool ${name}`)
-  }
-  if (
-    params.tool_choice?.type === 'tool' &&
-    params.tool_choice.name !== name
-  ) {
-    throw new Error(
-      `OpenAI-compatible provider returned tool ${name} instead of required tool ${params.tool_choice.name}`,
-    )
-  }
 }
 
 function linkedAbortController(signal: AbortSignal | undefined): AbortController {
@@ -1148,4 +797,12 @@ function combineAbortSignals(
     })
   }
   return controller.signal
+}
+
+async function compatibleResponseBody(response: Response, responses: boolean): Promise<ReadableStream<Uint8Array>> {
+  if (!response.body) throw new Error('OpenAI-compatible response body is empty')
+  if (!response.headers.get('content-type')?.includes('application/json')) return response.body
+  const parsed = await readCompatibleJSON(response)
+  const event = responses ? { type: parsed.status === 'failed' ? 'response.failed' : parsed.status === 'incomplete' ? 'response.incomplete' : 'response.completed', response: parsed } : parsed
+  return new Response(`data: ${JSON.stringify(event)}\n\ndata: [DONE]\n\n`).body!
 }

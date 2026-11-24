@@ -23,8 +23,12 @@ The adapter creates a fake Anthropic SDK client that translates Anthropic API ca
 - `prompt_tokens` / `completion_tokens` → `input_tokens` / `output_tokens`
 - `finish_reason: "length"` → `stop_reason: "max_tokens"`, `"tool_calls"` → `"tool_use"`
 - Textual tool calls (e.g. `Tool call Name: {...}`) parsed as fallback
-- Native `reasoning_effort` supported
+- Reasoning effort settings are omitted from provider requests for compatibility
+- Bounded, reported fallbacks for explicitly rejected optional parameters; schema changes require opt-in; never replay after streaming starts
+- RikkaHub-style reasoning history, content arrays, cache usage dialects, and tool-result image handling
 - Provider quirks handled (Mistral: no `stream_options`; o-series/GPT-5: no `temperature`/`top_p`)
+- Per-profile API mode, headers, timeouts, paths, and compatibility settings with environment overrides
+- Responses encrypted reasoning replay and mixed reasoning/tool/text streams
 - `GET /models` for model discovery
 
 ## Environment Variables

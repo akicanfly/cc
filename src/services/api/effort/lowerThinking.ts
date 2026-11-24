@@ -91,17 +91,6 @@ function lowerAnthropicThinking(
   }
 }
 
-function lowerOpenAIThinking(variantBlob: VariantBlob): LoweredThinking {
-  const reasoningEffort = asString(variantBlob.reasoningEffort)
-  if (!reasoningEffort) return {}
-
-  return {
-    extraBodyParams: {
-      reasoning_effort: reasoningEffort,
-    },
-  }
-}
-
 export function lowerThinking(
   options: LowerThinkingOptions,
   target: ThinkingTarget,
@@ -113,6 +102,6 @@ export function lowerThinking(
     case 'anthropic_native':
       return lowerAnthropicThinking(options, variantBlob)
     case 'openai_compatible':
-      return lowerOpenAIThinking(variantBlob)
+      return {}
   }
 }
